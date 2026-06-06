@@ -1,0 +1,14 @@
+{
+    "display_name": "Lorebook Extender",
+    "loading_order": 100,
+    "requires": [],
+    "optional": [],
+    "dependencies": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "ST_lorebook_extender contributors",
+    "version": "0.1.0",
+    "homePage": "",
+    "auto_update": true,
+    "minimum_client_version": "1.12.0"
+}

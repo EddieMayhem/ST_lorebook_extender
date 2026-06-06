@@ -1,0 +1,42 @@
+.lorebook-extender-settings .lbx-hint {
+    display: block;
+    color: var(--SmartThemeBodyColor);
+    opacity: 0.7;
+    font-size: 0.9em;
+    margin-bottom: 4px;
+}
+
+.lorebook-extender-settings label {
+    display: block;
+    margin-top: 8px;
+}
+
+.lorebook-extender-settings textarea.textarea_compact {
+    width: 100%;
+    min-height: 60px;
+    font-family: var(--monoFontFamily, monospace);
+    font-size: 0.9em;
+}
+
+.lorebook-extender-settings .flex-container {
+    gap: 10px;
+    margin-top: 4px;
+}
+
+.lorebook-extender-settings .lbx-status {
+    margin-top: 10px;
+    padding: 6px 8px;
+    border-radius: 4px;
+    background-color: var(--black30a);
+    font-size: 0.9em;
+    min-height: 1.2em;
+    white-space: pre-wrap;
+}
+
+.lorebook-extender-settings .lbx-status.error {
+    color: var(--warning);
+}
+
+.lorebook-extender-settings .lbx-status.success {
+    color: var(--okGreen, #4caf50);
+}

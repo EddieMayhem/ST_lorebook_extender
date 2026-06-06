@@ -1,0 +1,83 @@
+<div class="lorebook-extender-settings">
+    <div class="inline-drawer">
+        <div class="inline-drawer-toggle inline-drawer-header">
+            <b data-i18n="Lorebook Extender">Lorebook Extender</b>
+            <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+        </div>
+        <div class="inline-drawer-content">
+
+            <p class="lbx-hint" data-i18n="lbx_intro">
+                Diffs the current chat against the last snapshot, sends the diff and the
+                character's primary lorebook to a configurable LLM, and saves the result
+                as a new timestamped lorebook. Older versions are pruned to the configured
+                limit. Triggered manually with the button below.
+            </p>
+
+            <label class="checkbox_label" for="lbx_enabled">
+                <input id="lbx_enabled" type="checkbox" />
+                <span data-i18n="Enabled">Enabled</span>
+            </label>
+
+            <hr />
+
+            <label for="lbx_profile">
+                <span data-i18n="Connection profile">Connection profile</span>
+                <small class="lbx-hint" data-i18n="lbx_profile_hint">
+                    Leave on "(Active profile)" to use whichever connection is currently selected.
+                </small>
+            </label>
+            <select id="lbx_profile" class="text_pole"></select>
+
+            <label for="lbx_system_prompt">
+                <span data-i18n="System prompt">System prompt</span>
+            </label>
+            <textarea id="lbx_system_prompt" class="text_pole textarea_compact" rows="5"></textarea>
+
+            <label for="lbx_user_prompt">
+                <span data-i18n="User prompt template">User prompt template</span>
+                <small class="lbx-hint" data-i18n="lbx_user_prompt_hint">
+                    Placeholders: <code>{{CHARACTER_NAME}}</code>, <code>{{ORIGINAL_LOREBOOK}}</code>, <code>{{DIFF}}</code>.
+                </small>
+            </label>
+            <textarea id="lbx_user_prompt" class="text_pole textarea_compact" rows="10"></textarea>
+
+            <div class="flex-container">
+                <div class="flex1">
+                    <label for="lbx_max_tokens">
+                        <span data-i18n="Max output tokens">Max output tokens</span>
+                    </label>
+                    <input id="lbx_max_tokens" type="number" class="text_pole" min="256" step="128" />
+                </div>
+                <div class="flex1">
+                    <label for="lbx_max_versions">
+                        <span data-i18n="Max versions to keep">Max versions to keep</span>
+                    </label>
+                    <input id="lbx_max_versions" type="number" class="text_pole" min="1" step="1" />
+                </div>
+            </div>
+
+            <label class="checkbox_label" for="lbx_include_full">
+                <input id="lbx_include_full" type="checkbox" />
+                <span data-i18n="Include full chat on first run">
+                    Include full chat on first run (when no snapshot exists yet)
+                </span>
+            </label>
+
+            <hr />
+
+            <div class="flex-container">
+                <div id="lbx_run" class="menu_button menu_button_icon" title="Generate an extended lorebook now">
+                    <i class="fa-solid fa-wand-magic-sparkles"></i>
+                    <span data-i18n="Extend Lorebook Now">Extend Lorebook Now</span>
+                </div>
+                <div id="lbx_reset_snapshot" class="menu_button menu_button_icon" title="Forget the saved snapshot for the current chat">
+                    <i class="fa-solid fa-rotate-left"></i>
+                    <span data-i18n="Reset snapshot">Reset snapshot</span>
+                </div>
+            </div>
+
+            <div id="lbx_status" class="lbx-status"></div>
+
+        </div>
+    </div>
+</div>

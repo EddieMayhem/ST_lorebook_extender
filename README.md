@@ -1,0 +1,50 @@
+# Lorebook Extender
+
+A [SillyTavern](https://github.com/SillyTavern/SillyTavern) UI extension that grows a character's lorebook automatically from the conversation.
+
+When triggered, the extension:
+
+1. Takes the lorebook currently linked to the active character (`character.data.extensions.world`).
+2. Diffs the current chat against a per-chat snapshot of the last run.
+3. Sends the existing lorebook + the diff to a configurable LLM (via Connection Manager, with a configurable system prompt).
+4. Saves the LLM-returned lorebook JSON as a **new** lorebook named `<original> - YYYY-MM-DD HH-mm-ss`.
+5. Keeps at most N timestamped versions per original lorebook (default: 5), deleting the oldest.
+
+The original lorebook is never modified, and the character card is never silently re-linked.
+
+## Install
+
+In SillyTavern's *Extensions* panel, click **Install Extension** and paste this repo's URL.
+
+For local development, clone into `SillyTavern/public/scripts/extensions/third-party/ST_lorebook_extender/` and reload.
+
+## Use
+
+Open *Extensions* → **Lorebook Extender** drawer:
+
+| Setting | What it does |
+|---|---|
+| Enabled | Toggles the extension. |
+| Connection profile | Which Connection Manager profile to use. Leave on `(Active profile)` to use whatever the user has selected. |
+| System prompt | Sent as the `system` role. |
+| User prompt template | Sent as the `user` role. Supports `{{CHARACTER_NAME}}`, `{{ORIGINAL_LOREBOOK}}`, `{{DIFF}}`. |
+| Max output tokens | Cap on the LLM response length. |
+| Max versions to keep | How many timestamped siblings to keep before pruning. |
+| Include full chat on first run | If checked and no snapshot exists yet (first run on this chat), send the whole chat instead of failing. |
+
+Hit **Extend Lorebook Now** to run the pipeline. **Reset snapshot** forgets the saved snapshot for the current chat so the next run starts fresh.
+
+## Requirements
+
+- A character must be selected, and that character must have a lorebook linked on its card (the *World/Lorebook* field on the character).
+- Group chats are not supported.
+- Structured-output JSON works best on Chat Completion sources (OpenAI, Claude, etc.); for other backends the extension falls back to parsing whatever JSON the model produces.
+
+## Storage
+
+- Global settings: `extension_settings['lorebook_extender']`.
+- Per-chat snapshot: `chatMetadata['lorebook_extender_snapshot']` containing `{ lastProcessedIndex, lastProcessedAt, lastProcessedHash, sourceLorebook }`.
+
+## License
+
+AGPL-3.0
