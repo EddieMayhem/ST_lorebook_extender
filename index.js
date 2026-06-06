@@ -8,72 +8,52 @@
  * Old siblings beyond a configurable count are pruned (oldest first).
  */
 
-// world-info.js is dynamically imported inside the pipeline so a missing/moved
-// internal module cannot fail the whole extension module load.
-//
-// ST serves third-party extensions at different URL depths depending on the
-// install mode (e.g. "/scripts/extensions/<name>/" vs
-// "/scripts/extensions/third-party/<name>/"). Instead of hardcoding a
-// relative path with the wrong number of "../", we resolve absolute candidate
-// URLs from the current module's URL and try them in order.
-let _worldInfoModulePromise = null;
+// We deliberately do NOT import from SillyTavern's internal modules.
+// Different ST install modes serve extensions at different URL depths
+// ("/scripts/extensions/<name>/" vs "/scripts/extensions/third-party/<name>/"),
+// which makes relative imports unreliable. Everything we need is either on
+// getContext() or reachable via the documented HTTP API with getRequestHeaders().
 
-function getWorldInfoCandidateUrls() {
-    /** @type {string[]} */
-    const candidates = [];
-
-    // Always absolute. The canonical location is /scripts/world-info.js.
-    try {
-        const origin = (typeof location !== 'undefined') ? location.origin : '';
-        if (origin) candidates.push(`${origin}/scripts/world-info.js`);
-    } catch { /* ignore */ }
-
-    // Resolve relative to this module's URL, walking up parents.
-    try {
-        // import.meta.url is e.g. http://host/scripts/extensions/<name>/index.js
-        const here = new URL(import.meta.url);
-        const parts = here.pathname.split('/').filter(Boolean);
-        // Walk up until we find a 'scripts' segment, then resolve to /scripts/world-info.js.
-        const scriptsIdx = parts.indexOf('scripts');
-        if (scriptsIdx !== -1) {
-            const base = '/' + parts.slice(0, scriptsIdx + 1).join('/');
-            candidates.push(`${here.origin}${base}/world-info.js`);
-        }
-        // Also try the two most common relative depths.
-        candidates.push(new URL('../../world-info.js', here).href);
-        candidates.push(new URL('../../../world-info.js', here).href);
-        candidates.push(new URL('../../../scripts/world-info.js', here).href);
-        candidates.push(new URL('../../scripts/world-info.js', here).href);
-    } catch { /* ignore */ }
-
-    // De-duplicate while preserving order.
-    return Array.from(new Set(candidates));
+/**
+ * Create a new (empty) world info file. Mirrors createNewWorldInfo() from
+ * scripts/world-info.js, but only uses getContext-exposed surface.
+ * @param {string} name
+ * @returns {Promise<boolean>} true on success
+ */
+async function createEmptyWorldInfo(name) {
+    const ctx = SillyTavern.getContext();
+    if (!name || typeof name !== 'string') return false;
+    // Check overwrite up front; createNewWorldInfo would prompt interactively,
+    // we just refuse silently and let the caller pick a different name.
+    const existing = ctx.getWorldInfoNames?.() ?? [];
+    if (existing.includes(name)) return false;
+    await ctx.saveWorldInfo(name, { entries: {} }, true);
+    await ctx.updateWorldInfoList?.();
+    return true;
 }
 
-async function loadWorldInfoModule() {
-    if (_worldInfoModulePromise) return _worldInfoModulePromise;
-
-    const candidates = getWorldInfoCandidateUrls();
-    _worldInfoModulePromise = (async () => {
-        const errors = [];
-        for (const url of candidates) {
-            try {
-                /* webpackIgnore: true */
-                const mod = await import(/* @vite-ignore */ url);
-                if (mod && typeof mod.createNewWorldInfo === 'function' && typeof mod.deleteWorldInfo === 'function') {
-                    console.debug(`[lorebook_extender] Loaded world-info.js from ${url}`);
-                    return mod;
-                }
-                errors.push(`${url}: loaded but missing expected exports`);
-            } catch (e) {
-                errors.push(`${url}: ${e?.message || e}`);
-            }
-        }
-        const err = new Error('Could not locate SillyTavern world-info.js. Tried:\n' + errors.join('\n'));
-        _worldInfoModulePromise = null; // allow retry next click
-        throw err;
-    })();
-    return _worldInfoModulePromise;
+/**
+ * Delete a world info file. Mirrors deleteWorldInfo() from
+ * scripts/world-info.js via the documented /api/worldinfo/delete endpoint.
+ * @param {string} name
+ * @returns {Promise<boolean>} true on success
+ */
+async function deleteWorldInfoFile(name) {
+    const ctx = SillyTavern.getContext();
+    if (!name || typeof name !== 'string') return false;
+    const headers = typeof ctx.getRequestHeaders === 'function' ? ctx.getRequestHeaders() : {};
+    const response = await fetch('/api/worldinfo/delete', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ name }),
+    });
+    if (!response.ok) {
+        const text = await response.text().catch(() => '');
+        console.warn(`[lorebook_extender] /api/worldinfo/delete ${response.status}: ${text}`);
+        return false;
+    }
+    await ctx.updateWorldInfoList?.();
+    return true;
 }
 
 const MODULE_NAME = 'lorebook_extender';
@@ -498,20 +478,6 @@ async function runExtendPipeline() {
         throw new Error('Extension is disabled in settings');
     }
 
-    // Load the world-info module dynamically so its absence/path issues don't
-    // break the entire extension at module-evaluation time.
-    let worldInfoModule;
-    try {
-        worldInfoModule = await loadWorldInfoModule();
-    } catch (e) {
-        console.error(`[${MODULE_NAME}] Failed to import world-info.js:`, e);
-        throw new Error('Could not load SillyTavern world-info module (see console)');
-    }
-    const { createNewWorldInfo, deleteWorldInfo } = worldInfoModule;
-    if (typeof createNewWorldInfo !== 'function' || typeof deleteWorldInfo !== 'function') {
-        throw new Error('SillyTavern world-info module is missing expected exports');
-    }
-
     // 1. Validate context.
     if (ctx.groupId) {
         throw new Error('Group chats are not supported (no single primary character)');
@@ -651,7 +617,7 @@ async function runExtendPipeline() {
     }
 
     // 7. Create + save.
-    const created = await createNewWorldInfo(newName, { interactive: false });
+    const created = await createEmptyWorldInfo(newName);
     if (!created) {
         throw new Error(`Failed to create lorebook "${newName}"`);
     }
@@ -677,7 +643,7 @@ async function runExtendPipeline() {
         const victim = siblings.shift();
         if (victim.name === newName) continue; // never delete the one we just made
         try {
-            const ok = await deleteWorldInfo(victim.name);
+            const ok = await deleteWorldInfoFile(victim.name);
             if (ok !== false) deleted++;
         } catch (e) {
             console.warn(`[${MODULE_NAME}] Failed to delete "${victim.name}":`, e);

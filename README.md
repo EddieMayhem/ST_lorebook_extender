@@ -45,6 +45,16 @@ Hit **Extend Lorebook Now** to run the pipeline. **Reset snapshot** forgets the 
 - Global settings: `extension_settings['lorebook_extender']`.
 - Per-chat snapshot: `chatMetadata['lorebook_extender_snapshot']` containing `{ lastProcessedIndex, lastProcessedAt, lastProcessedHash, sourceLorebook }`.
 
+## Troubleshooting
+
+**The extension is running old code after an update.** ST's *Update* button doesn't always invalidate the browser module cache. To force a clean reload:
+
+1. Click *Update* on the extension in ST's *Extensions* manager.
+2. Hard-refresh the page (Ctrl+Shift+R / Cmd+Shift+R).
+3. If still stale, on the server: `git -C <ST_root>/data/<user>/extensions/ST_lorebook_extender pull` (or `<ST_root>/public/scripts/extensions/third-party/ST_lorebook_extender` for "all users" installs), then hard-refresh.
+
+**`[object Event]` failure to load.** Almost always a path-resolution problem in an older version of this extension. Update to ≥ 0.2.0, which no longer depends on relative imports to ST internals.
+
 ## License
 
 AGPL-3.0
