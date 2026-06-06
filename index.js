@@ -8,10 +8,20 @@
  * Old siblings beyond a configurable count are pruned (oldest first).
  */
 
-import {
-    createNewWorldInfo,
-    deleteWorldInfo,
-} from '../../../scripts/world-info.js';
+// world-info.js is dynamically imported inside the pipeline so a missing/moved
+// internal module cannot fail the whole extension module load.
+let _worldInfoModulePromise = null;
+function loadWorldInfoModule() {
+    if (!_worldInfoModulePromise) {
+        // Served path: /scripts/extensions/third-party/<name>/index.js
+        // Target path: /scripts/world-info.js  => "../../world-info.js"
+        _worldInfoModulePromise = import('../../world-info.js').catch(err => {
+            _worldInfoModulePromise = null; // allow retry
+            throw err;
+        });
+    }
+    return _worldInfoModulePromise;
+}
 
 const MODULE_NAME = 'lorebook_extender';
 const EXTENSION_FOLDER = 'third-party/ST_lorebook_extender';
@@ -435,6 +445,20 @@ async function runExtendPipeline() {
         throw new Error('Extension is disabled in settings');
     }
 
+    // Load the world-info module dynamically so its absence/path issues don't
+    // break the entire extension at module-evaluation time.
+    let worldInfoModule;
+    try {
+        worldInfoModule = await loadWorldInfoModule();
+    } catch (e) {
+        console.error(`[${MODULE_NAME}] Failed to import world-info.js:`, e);
+        throw new Error('Could not load SillyTavern world-info module (see console)');
+    }
+    const { createNewWorldInfo, deleteWorldInfo } = worldInfoModule;
+    if (typeof createNewWorldInfo !== 'function' || typeof deleteWorldInfo !== 'function') {
+        throw new Error('SillyTavern world-info module is missing expected exports');
+    }
+
     // 1. Validate context.
     if (ctx.groupId) {
         throw new Error('Group chats are not supported (no single primary character)');
@@ -808,13 +832,20 @@ async function initialize() {
     });
 }
 
-// Hook into APP_READY. eventSource is available immediately.
-const ctx = SillyTavern.getContext();
-if (ctx?.eventSource && ctx.eventTypes?.APP_READY) {
-    ctx.eventSource.on(ctx.eventTypes.APP_READY, () => {
-        initialize().catch(err => console.error(`[${MODULE_NAME}] init error:`, err));
+// Bootstrap: defer all initialization until DOMReady so SillyTavern and
+// jQuery are guaranteed to be available. Wrap in a try/catch so a single
+// failure cannot break ST's "Extensions" panel for the user.
+if (typeof jQuery === 'function') {
+    jQuery(async () => {
+        try {
+            await initialize();
+        } catch (err) {
+            console.error(`[${MODULE_NAME}] init error:`, err);
+        }
     });
 } else {
-    // Fallback: try once on next tick.
-    setTimeout(() => initialize().catch(err => console.error(`[${MODULE_NAME}] init error:`, err)), 0);
+    // Fallback if jQuery isn't loaded for some reason: try on next tick.
+    setTimeout(() => {
+        initialize().catch(err => console.error(`[${MODULE_NAME}] init error:`, err));
+    }, 0);
 }
