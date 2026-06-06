@@ -669,6 +669,280 @@ async function runExtendPipeline() {
     return parts.join(' · ');
 }
 
+// ------------------------------------------------------------- diff engine -
+
+/**
+ * Find the newest "<originalName> - <timestamp>" sibling of a given book.
+ * Returns { name, ts } of the newest match, or null if none exist.
+ * Uses the same matching logic as the cleanup step in the extend pipeline.
+ */
+function findLatestSibling(originalName, dateFormat) {
+    const ctx = SillyTavern.getContext();
+    const prefix = `${originalName} - `;
+    const siblings = (ctx.getWorldInfoNames?.() ?? [])
+        .filter(n => n !== originalName && n.startsWith(prefix))
+        .map(n => {
+            const suffix = n.slice(prefix.length).replace(/-\d+$/, '');
+            const ts = parseStampSuffix(suffix, dateFormat);
+            return ts === null ? null : { name: n, ts };
+        })
+        .filter(Boolean)
+        .sort((a, b) => b.ts - a.ts); // newest first
+    return siblings[0] ?? null;
+}
+
+/** Shallow-equal for arrays (string elements expected). */
+function arrShallowEq(a, b) {
+    if (!Array.isArray(a) || !Array.isArray(b)) return false;
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+    return true;
+}
+
+/** Loose equality for entry field values (arrays compared element-wise). */
+function entryValuesEqual(a, b) {
+    if (Array.isArray(a) || Array.isArray(b)) return arrShallowEq(a, b);
+    if (a === b) return true;
+    // null/undefined collapsed: many ST entry fields default to null.
+    if ((a === null || a === undefined) && (b === null || b === undefined)) return true;
+    return false;
+}
+
+/** Make a stable matching key from an entry. Returns null if no good key. */
+function entryMatchKey(entry, mode) {
+    if (!entry || typeof entry !== 'object') return null;
+    switch (mode) {
+        case 'uid':
+            return entry.uid !== undefined && entry.uid !== null ? `uid:${entry.uid}` : null;
+        case 'comment': {
+            const c = (entry.comment ?? '').toString().trim().toLowerCase();
+            return c.length > 0 ? `comment:${c}` : null;
+        }
+        case 'firstKey': {
+            if (Array.isArray(entry.key) && entry.key.length > 0) {
+                const k = String(entry.key[0] ?? '').trim().toLowerCase();
+                return k.length > 0 ? `key:${k}` : null;
+            }
+            return null;
+        }
+        default:
+            return null;
+    }
+}
+
+/**
+ * Compute a per-entry diff between two lorebook objects.
+ * @param {{entries?: Record<string, any>}} oldBook
+ * @param {{entries?: Record<string, any>}} newBook
+ * @returns {{
+ *   added: Array<object>,
+ *   removed: Array<object>,
+ *   modified: Array<{ oldEntry: object, newEntry: object, fields: string[] }>
+ * }}
+ */
+function diffLorebooks(oldBook, newBook) {
+    const oldEntries = oldBook && typeof oldBook.entries === 'object' && oldBook.entries
+        ? Object.values(oldBook.entries) : [];
+    const newEntries = newBook && typeof newBook.entries === 'object' && newBook.entries
+        ? Object.values(newBook.entries) : [];
+
+    // Build lookup tables for old entries.
+    const oldByUid = new Map();
+    const oldByComment = new Map();
+    const oldByFirstKey = new Map();
+    for (const e of oldEntries) {
+        const ku = entryMatchKey(e, 'uid');       if (ku && !oldByUid.has(ku)) oldByUid.set(ku, e);
+        const kc = entryMatchKey(e, 'comment');   if (kc && !oldByComment.has(kc)) oldByComment.set(kc, e);
+        const kk = entryMatchKey(e, 'firstKey');  if (kk && !oldByFirstKey.has(kk)) oldByFirstKey.set(kk, e);
+    }
+
+    const consumed = new Set(); // identity-set of old entries already matched
+    const added = [];
+    const modified = [];
+
+    for (const newEntry of newEntries) {
+        let match = null;
+
+        // Try uid, then comment, then firstKey, never re-consuming.
+        for (const mode of ['uid', 'comment', 'firstKey']) {
+            const key = entryMatchKey(newEntry, mode);
+            if (!key) continue;
+            const table = mode === 'uid' ? oldByUid : mode === 'comment' ? oldByComment : oldByFirstKey;
+            const candidate = table.get(key);
+            if (candidate && !consumed.has(candidate)) { match = candidate; break; }
+        }
+
+        if (!match) {
+            added.push(newEntry);
+            continue;
+        }
+
+        consumed.add(match);
+
+        // Compare fields. Ignore uid (extension reassigns these during normalization).
+        const changedFields = [];
+        const allKeys = new Set([...Object.keys(match), ...Object.keys(newEntry)]);
+        allKeys.delete('uid');
+        for (const k of allKeys) {
+            if (!entryValuesEqual(match[k], newEntry[k])) changedFields.push(k);
+        }
+
+        if (changedFields.length === 0) continue; // truly identical, skip
+        modified.push({ oldEntry: match, newEntry, fields: changedFields });
+    }
+
+    const removed = oldEntries.filter(e => !consumed.has(e));
+
+    return { added, removed, modified };
+}
+
+// ------------------------------------------------------------ diff rendering
+
+function escapeHtml(input) {
+    return String(input ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+/**
+ * Build a unified HTML diff for a content string change, using DiffMatchPatch
+ * when available, with a graceful fallback otherwise.
+ */
+function renderContentDiff(oldText, newText) {
+    const safeOld = String(oldText ?? '');
+    const safeNew = String(newText ?? '');
+
+    /** @type {any} */
+    const DiffMatchPatch = SillyTavern?.libs?.DiffMatchPatch;
+    if (DiffMatchPatch) {
+        try {
+            const dmp = new DiffMatchPatch();
+            const diff = dmp.diff_main(safeOld, safeNew);
+            if (typeof dmp.diff_cleanupSemantic === 'function') dmp.diff_cleanupSemantic(diff);
+            const html = diff.map(([op, text]) => {
+                const safe = escapeHtml(text);
+                if (op === -1) return `<del>${safe}</del>`;
+                if (op === 1) return `<ins>${safe}</ins>`;
+                return safe;
+            }).join('');
+            return html;
+        } catch (e) {
+            console.warn(`[${MODULE_NAME}] DiffMatchPatch failed, falling back:`, e);
+        }
+    }
+
+    // Fallback: line-by-line side-by-side with a naive line union.
+    const oldLines = safeOld.split('\n');
+    const newLines = safeNew.split('\n');
+    const oldSet = new Set(oldLines);
+    const newSet = new Set(newLines);
+    const out = [];
+    for (const line of oldLines) {
+        if (!newSet.has(line)) out.push(`<del>${escapeHtml(line)}</del>`);
+        else out.push(escapeHtml(line));
+    }
+    for (const line of newLines) {
+        if (!oldSet.has(line)) out.push(`<ins>${escapeHtml(line)}</ins>`);
+    }
+    return out.join('\n');
+}
+
+function entryKeysSummary(entry) {
+    const keys = Array.isArray(entry?.key) ? entry.key : [];
+    if (keys.length === 0) return '<em class="lbx-diff-empty">(no keys)</em>';
+    return escapeHtml(JSON.stringify(keys));
+}
+
+function entryCommentSummary(entry) {
+    const c = (entry?.comment ?? '').toString().trim();
+    return c.length ? escapeHtml(c) : '<em class="lbx-diff-empty">(no title)</em>';
+}
+
+function renderAddedRemovedCard(entry, kind) {
+    const content = (entry?.content ?? '').toString();
+    const safeContent = escapeHtml(content);
+    return `
+        <div class="lbx-diff-card ${kind}">
+            <div class="lbx-diff-comment">${entryCommentSummary(entry)}</div>
+            <div class="lbx-diff-keys">keys: ${entryKeysSummary(entry)}</div>
+            ${content ? `<pre class="lbx-diff-content">${safeContent}</pre>` : ''}
+        </div>
+    `;
+}
+
+function renderModifiedCard(oldEntry, newEntry, fields) {
+    const includesContent = fields.includes('content');
+    const otherFields = fields.filter(f => f !== 'content');
+    const fieldsLine = otherFields.length
+        ? `<div class="lbx-diff-fields-changed">Fields changed: ${escapeHtml(otherFields.join(', '))}</div>`
+        : '';
+    const contentBlock = includesContent
+        ? `<pre class="lbx-diff-content">${renderContentDiff(oldEntry.content, newEntry.content)}</pre>`
+        : '';
+    return `
+        <div class="lbx-diff-card modified">
+            <div class="lbx-diff-comment">${entryCommentSummary(newEntry)}</div>
+            <div class="lbx-diff-keys">keys: ${entryKeysSummary(newEntry)}</div>
+            ${fieldsLine}
+            ${contentBlock}
+        </div>
+    `;
+}
+
+function buildDiffHtml({ originalName, latestName, diff }) {
+    const a = diff.added.length;
+    const r = diff.removed.length;
+    const m = diff.modified.length;
+
+    const header = `
+        <div class="lbx-diff-header">
+            <div class="lbx-diff-names">
+                <div><strong>Base (linked):</strong> <code>${escapeHtml(originalName)}</code></div>
+                <div><strong>Latest extended:</strong> <code>${escapeHtml(latestName)}</code></div>
+            </div>
+            <div class="lbx-diff-stats">
+                <span class="added">+${a}</span> added ·
+                <span class="removed">-${r}</span> removed ·
+                <span class="modified">~${m}</span> modified
+            </div>
+        </div>
+    `;
+
+    if (a === 0 && r === 0 && m === 0) {
+        return header + `<p class="lbx-diff-empty">Lorebooks are identical.</p>`;
+    }
+
+    const addedSection = `
+        <div class="lbx-diff-section">
+            <h3>Added (${a})</h3>
+            ${a === 0
+                ? '<div class="lbx-diff-empty">None</div>'
+                : diff.added.map(e => renderAddedRemovedCard(e, 'added')).join('')}
+        </div>
+    `;
+    const removedSection = `
+        <div class="lbx-diff-section">
+            <h3>Removed (${r})</h3>
+            ${r === 0
+                ? '<div class="lbx-diff-empty">None</div>'
+                : diff.removed.map(e => renderAddedRemovedCard(e, 'removed')).join('')}
+        </div>
+    `;
+    const modifiedSection = `
+        <div class="lbx-diff-section">
+            <h3>Modified (${m})</h3>
+            ${m === 0
+                ? '<div class="lbx-diff-empty">None</div>'
+                : diff.modified.map(x => renderModifiedCard(x.oldEntry, x.newEntry, x.fields)).join('')}
+        </div>
+    `;
+
+    return header + addedSection + modifiedSection + removedSection;
+}
+
 // --------------------------------------------------------------------- UI ---
 
 let statusEl = /** @type {HTMLElement | null} */ (null);
@@ -720,6 +994,74 @@ async function onResetSnapshotClicked() {
     toastr.info('Snapshot cleared for this chat', 'Lorebook Extender');
 }
 
+async function onViewDiffClicked(event) {
+    event?.preventDefault?.();
+    const button = event?.currentTarget;
+    button?.classList?.add('disabled');
+    try {
+        const ctx = SillyTavern.getContext();
+        const settings = getSettings();
+
+        // Validate prerequisites (same checks as the extend pipeline, minus chat).
+        if (ctx.groupId) {
+            throw new Error('Group chats are not supported (no single primary character)');
+        }
+        if (ctx.characterId === undefined || ctx.characterId === null) {
+            throw new Error('No character is currently selected');
+        }
+        const character = ctx.characters[ctx.characterId];
+        if (!character) {
+            throw new Error('Active character could not be resolved');
+        }
+        const originalName = character?.data?.extensions?.world;
+        if (!originalName || typeof originalName !== 'string') {
+            throw new Error('Active character has no primary lorebook linked');
+        }
+
+        const latest = findLatestSibling(originalName, settings.dateFormat);
+        if (!latest) {
+            toastr.info(
+                `No extended sibling found for "${originalName}". Click "Extend Lorebook Now" first.`,
+                'Lorebook Extender',
+            );
+            return;
+        }
+
+        const [oldData, newData] = await Promise.all([
+            ctx.loadWorldInfo(originalName),
+            ctx.loadWorldInfo(latest.name),
+        ]);
+        if (!oldData) throw new Error(`Could not load lorebook "${originalName}"`);
+        if (!newData) throw new Error(`Could not load lorebook "${latest.name}"`);
+
+        const diff = diffLorebooks(oldData, newData);
+        const html = buildDiffHtml({
+            originalName,
+            latestName: latest.name,
+            diff,
+        });
+
+        const Popup = ctx.Popup;
+        const POPUP_TYPE = ctx.POPUP_TYPE;
+        if (!Popup || !POPUP_TYPE) {
+            throw new Error('SillyTavern Popup API is unavailable');
+        }
+        const popup = new Popup(html, POPUP_TYPE.TEXT, '', {
+            wide: true,
+            large: true,
+            okButton: 'Close',
+            allowVerticalScrolling: true,
+        });
+        await popup.show();
+    } catch (e) {
+        const msg = (e && e.message) ? e.message : String(e);
+        console.error(`[${MODULE_NAME}]`, e);
+        toastr.error(msg, 'Lorebook Extender');
+    } finally {
+        button?.classList?.remove('disabled');
+    }
+}
+
 function bindUi(root) {
     const settings = getSettings();
     const $ = (sel) => /** @type {HTMLElement | null} */ (root.querySelector(sel));
@@ -732,6 +1074,7 @@ function bindUi(root) {
     const includeEl = /** @type {HTMLInputElement} */ ($('#lbx_include_full'));
     const runBtn = $('#lbx_run');
     const resetBtn = $('#lbx_reset_snapshot');
+    const viewDiffBtn = $('#lbx_view_diff');
     const profileEl = /** @type {HTMLSelectElement} */ ($('#lbx_profile'));
     statusEl = $('#lbx_status');
 
@@ -763,6 +1106,7 @@ function bindUi(root) {
 
     runBtn?.addEventListener('click', onExtendClicked);
     resetBtn?.addEventListener('click', onResetSnapshotClicked);
+    viewDiffBtn?.addEventListener('click', onViewDiffClicked);
 
     // Connection profile dropdown. Use the Connection Manager helper when available,
     // otherwise build a static placeholder.

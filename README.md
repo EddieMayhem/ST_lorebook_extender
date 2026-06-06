@@ -32,7 +32,7 @@ Open *Extensions* → **Lorebook Extender** drawer:
 | Max versions to keep | How many timestamped siblings to keep before pruning. |
 | Include full chat on first run | If checked and no snapshot exists yet (first run on this chat), send the whole chat instead of failing. |
 
-Hit **Extend Lorebook Now** to run the pipeline. **Reset snapshot** forgets the saved snapshot for the current chat so the next run starts fresh.
+Hit **Extend Lorebook Now** to run the pipeline. **Reset snapshot** forgets the saved snapshot for the current chat so the next run starts fresh. **View latest diff** opens a popup comparing the newest timestamped sibling against the character's currently linked lorebook (read-only — added / removed / modified entries, with an inline text diff of changed `content` fields).
 
 ## Requirements
 

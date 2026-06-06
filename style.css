@@ -40,3 +40,110 @@
 .lorebook-extender-settings .lbx-status.success {
     color: var(--okGreen, #4caf50);
 }
+
+/* ----------------------------------------------------------------- diff -- */
+
+.lbx-diff-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 6px 8px;
+    border-radius: 4px;
+    background-color: var(--black30a);
+    margin-bottom: 10px;
+}
+
+.lbx-diff-header .lbx-diff-names {
+    display: flex;
+    flex-direction: column;
+    font-size: 0.95em;
+    word-break: break-all;
+}
+
+.lbx-diff-header .lbx-diff-names code {
+    font-family: var(--monoFontFamily, monospace);
+}
+
+.lbx-diff-stats {
+    font-family: var(--monoFontFamily, monospace);
+    font-size: 0.95em;
+    white-space: nowrap;
+}
+
+.lbx-diff-stats .added { color: var(--okGreen, #4caf50); }
+.lbx-diff-stats .removed { color: var(--warning, #f44336); }
+.lbx-diff-stats .modified { color: var(--SmartThemeQuoteColor, #c9a227); }
+
+.lbx-diff-section {
+    margin-top: 14px;
+}
+
+.lbx-diff-section h3 {
+    margin: 0 0 6px 0;
+    font-size: 1em;
+    border-bottom: 1px solid var(--SmartThemeBorderColor, #555);
+    padding-bottom: 2px;
+}
+
+.lbx-diff-empty {
+    opacity: 0.6;
+    font-style: italic;
+    padding: 4px 0;
+}
+
+.lbx-diff-card {
+    border: 1px solid var(--SmartThemeBorderColor, #555);
+    border-left-width: 4px;
+    border-radius: 4px;
+    padding: 8px 10px;
+    margin-bottom: 8px;
+    background-color: var(--black30a);
+}
+
+.lbx-diff-card.added    { border-left-color: var(--okGreen, #4caf50); }
+.lbx-diff-card.removed  { border-left-color: var(--warning, #f44336); }
+.lbx-diff-card.modified { border-left-color: var(--SmartThemeQuoteColor, #c9a227); }
+
+.lbx-diff-card .lbx-diff-comment {
+    font-weight: bold;
+    margin-bottom: 2px;
+}
+
+.lbx-diff-card .lbx-diff-keys {
+    font-family: var(--monoFontFamily, monospace);
+    opacity: 0.8;
+    font-size: 0.9em;
+    word-break: break-all;
+}
+
+.lbx-diff-card .lbx-diff-fields-changed {
+    font-size: 0.85em;
+    opacity: 0.85;
+    margin-top: 4px;
+}
+
+.lbx-diff-content {
+    margin-top: 6px;
+    font-family: var(--monoFontFamily, monospace);
+    font-size: 0.85em;
+    white-space: pre-wrap;
+    max-height: 220px;
+    overflow: auto;
+    background: rgba(0, 0, 0, 0.2);
+    padding: 6px;
+    border-radius: 3px;
+}
+
+.lbx-diff-content ins {
+    background-color: rgba(76, 175, 80, 0.30);
+    text-decoration: none;
+    color: inherit;
+}
+
+.lbx-diff-content del {
+    background-color: rgba(244, 67, 54, 0.30);
+    text-decoration: line-through;
+    color: inherit;
+}
