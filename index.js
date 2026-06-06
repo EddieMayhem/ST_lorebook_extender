@@ -631,8 +631,14 @@ async function runExtendPipeline() {
     const siblings = ctx.getWorldInfoNames()
         .filter(n => n !== originalName && n.startsWith(prefix))
         .map(n => {
-            const suffix = n.slice(prefix.length).replace(/-\d+$/, ''); // strip trailing counter
-            const ts = parseStampSuffix(suffix, settings.dateFormat);
+            const rawSuffix = n.slice(prefix.length);
+            // Try the full suffix first; only strip a trailing "-N" collision counter
+            // as a fallback, because the timestamp itself ends with "-NN" (seconds).
+            let ts = parseStampSuffix(rawSuffix, settings.dateFormat);
+            if (ts === null) {
+                const stripped = rawSuffix.replace(/-\d+$/, '');
+                if (stripped !== rawSuffix) ts = parseStampSuffix(stripped, settings.dateFormat);
+            }
             return ts === null ? null : { name: n, ts };
         })
         .filter(Boolean)
@@ -673,22 +679,63 @@ async function runExtendPipeline() {
 
 /**
  * Find the newest "<originalName> - <timestamp>" sibling of a given book.
- * Returns { name, ts } of the newest match, or null if none exist.
+ * Returns { name, ts } of the newest strict match, or null if none exist.
  * Uses the same matching logic as the cleanup step in the extend pipeline.
  */
 function findLatestSibling(originalName, dateFormat) {
+    const candidates = findSiblingCandidates(originalName, dateFormat);
+    const strict = candidates.find(c => c.tier === 'strict');
+    return strict ?? null;
+}
+
+/**
+ * Locate any plausible "sibling" of a lorebook, in decreasing strictness:
+ *   - tier 'strict': "<name> - <YYYY-MM-DD HH-mm-ss>" (extension's own format)
+ *   - tier 'loose':  starts with "<name> - " but suffix doesn't parse as our format
+ *   - tier 'fuzzy':  starts with "<name>" (no separator requirement) but isn't <name> itself
+ *
+ * Within each tier, strict is sorted by parsed timestamp desc; loose/fuzzy are
+ * sorted by name desc (so ISO-ish suffixes still come out newest-first).
+ *
+ * @returns {Array<{ name: string, ts: number|null, tier: 'strict'|'loose'|'fuzzy' }>}
+ */
+function findSiblingCandidates(originalName, dateFormat) {
     const ctx = SillyTavern.getContext();
-    const prefix = `${originalName} - `;
-    const siblings = (ctx.getWorldInfoNames?.() ?? [])
-        .filter(n => n !== originalName && n.startsWith(prefix))
-        .map(n => {
-            const suffix = n.slice(prefix.length).replace(/-\d+$/, '');
-            const ts = parseStampSuffix(suffix, dateFormat);
-            return ts === null ? null : { name: n, ts };
-        })
-        .filter(Boolean)
-        .sort((a, b) => b.ts - a.ts); // newest first
-    return siblings[0] ?? null;
+    const names = (ctx.getWorldInfoNames?.() ?? []).filter(n => n !== originalName);
+    if (!originalName || !names.length) return [];
+
+    const strict = [];
+    const loose = [];
+    const fuzzy = [];
+
+    const sepPrefix = `${originalName} - `;
+    for (const n of names) {
+        if (n.startsWith(sepPrefix)) {
+            const rawSuffix = n.slice(sepPrefix.length);
+            // Try the full suffix first; only strip a trailing counter (e.g. "-2") as a fallback,
+            // because our own timestamp itself ends with "-NN" (seconds).
+            let ts = parseStampSuffix(rawSuffix, dateFormat);
+            if (ts === null) {
+                const stripped = rawSuffix.replace(/-\d+$/, '');
+                if (stripped !== rawSuffix) ts = parseStampSuffix(stripped, dateFormat);
+            }
+            if (ts !== null) {
+                strict.push({ name: n, ts, tier: 'strict' });
+            } else {
+                loose.push({ name: n, ts: null, tier: 'loose' });
+            }
+        } else if (n.startsWith(originalName)) {
+            // No " - " separator, but the original is a prefix. Common for
+            // hand-named exports like "<name>_2026-06-06" or "<name>(v2)".
+            fuzzy.push({ name: n, ts: null, tier: 'fuzzy' });
+        }
+    }
+
+    strict.sort((a, b) => b.ts - a.ts);
+    loose.sort((a, b) => b.name.localeCompare(a.name));
+    fuzzy.sort((a, b) => b.name.localeCompare(a.name));
+
+    return [...strict, ...loose, ...fuzzy];
 }
 
 /** Shallow-equal for arrays (string elements expected). */
@@ -1018,26 +1065,54 @@ async function onViewDiffClicked(event) {
             throw new Error('Active character has no primary lorebook linked');
         }
 
-        const latest = findLatestSibling(originalName, settings.dateFormat);
-        if (!latest) {
+        // Refresh the world info list from the server so stale caches can't hide a sibling.
+        try { await ctx.updateWorldInfoList?.(); } catch (e) {
+            console.warn(`[${MODULE_NAME}] updateWorldInfoList failed (continuing):`, e);
+        }
+
+        const candidates = findSiblingCandidates(originalName, settings.dateFormat);
+        if (candidates.length === 0) {
+            const allNames = (ctx.getWorldInfoNames?.() ?? []);
+            const sample = allNames.slice(0, 20).map(n => `  • ${n}`).join('\n');
+            const more = allNames.length > 20 ? `\n  …and ${allNames.length - 20} more` : '';
+            console.warn(`[${MODULE_NAME}] No siblings found for "${originalName}". Existing books:\n${sample}${more}`);
             toastr.info(
-                `No extended sibling found for "${originalName}". Click "Extend Lorebook Now" first.`,
+                `No sibling of "${originalName}" found.\nSee browser console for the list of detected lorebooks.`,
                 'Lorebook Extender',
+                { timeOut: 8000 },
             );
             return;
         }
 
+        // Pick the sibling to use.
+        /** @type {{name: string, ts: number|null, tier: string}} */
+        let chosen;
+        const strictCandidates = candidates.filter(c => c.tier === 'strict');
+
+        if (strictCandidates.length > 0) {
+            // Trust the newest strict match outright.
+            chosen = strictCandidates[0];
+        } else if (candidates.length === 1) {
+            // Only one fuzzy/loose match — use it.
+            chosen = candidates[0];
+        } else {
+            // Multiple loose/fuzzy candidates; let the user pick.
+            const picked = await promptSiblingChoice(candidates, originalName);
+            if (!picked) return; // cancelled
+            chosen = picked;
+        }
+
         const [oldData, newData] = await Promise.all([
             ctx.loadWorldInfo(originalName),
-            ctx.loadWorldInfo(latest.name),
+            ctx.loadWorldInfo(chosen.name),
         ]);
         if (!oldData) throw new Error(`Could not load lorebook "${originalName}"`);
-        if (!newData) throw new Error(`Could not load lorebook "${latest.name}"`);
+        if (!newData) throw new Error(`Could not load lorebook "${chosen.name}"`);
 
         const diff = diffLorebooks(oldData, newData);
         const html = buildDiffHtml({
             originalName,
-            latestName: latest.name,
+            latestName: chosen.name,
             diff,
         });
 
@@ -1060,6 +1135,63 @@ async function onViewDiffClicked(event) {
     } finally {
         button?.classList?.remove('disabled');
     }
+}
+
+/**
+ * Show a small popup with a <select> listing sibling candidates. The user
+ * picks one and clicks OK; we read the selection from the live DOM node.
+ * Returns the chosen candidate or null if cancelled.
+ *
+ * @param {Array<{name: string, ts: number|null, tier: string}>} candidates
+ * @param {string} originalName
+ * @returns {Promise<{name: string, ts: number|null, tier: string} | null>}
+ */
+async function promptSiblingChoice(candidates, originalName) {
+    const ctx = SillyTavern.getContext();
+    const Popup = ctx.Popup;
+    const POPUP_TYPE = ctx.POPUP_TYPE;
+    const POPUP_RESULT = ctx.POPUP_RESULT;
+    if (!Popup || !POPUP_TYPE || !POPUP_RESULT) {
+        // Fallback: just pick the first.
+        return candidates[0] ?? null;
+    }
+
+    const optionsHtml = candidates.map((c, idx) => {
+        const tag =
+            c.tier === 'strict' ? '[strict]' :
+            c.tier === 'loose'  ? '[loose]'  : '[fuzzy]';
+        return `<option value="${idx}">${escapeHtml(tag)} ${escapeHtml(c.name)}</option>`;
+    }).join('');
+
+    const html = `
+        <div class="lbx-diff-picker">
+            <p>No strict-format sibling found for <code>${escapeHtml(originalName)}</code>.
+            Pick which lorebook to compare against:</p>
+            <select id="lbx_diff_pick" class="text_pole" style="width:100%; margin-top:6px;">
+                ${optionsHtml}
+            </select>
+            <p class="lbx-hint" style="margin-top:6px; opacity:0.7; font-size:0.85em;">
+                Tiers: <strong>strict</strong> = matches this extension's "<code>${escapeHtml(originalName)} - YYYY-MM-DD HH-mm-ss</code>" format;
+                <strong>loose</strong> = starts with "<code>${escapeHtml(originalName)} - </code>" but a different suffix;
+                <strong>fuzzy</strong> = name starts with "<code>${escapeHtml(originalName)}</code>".
+            </p>
+        </div>
+    `;
+
+    const popup = new Popup(html, POPUP_TYPE.TEXT, '', {
+        wide: true,
+        okButton: 'Compare',
+        cancelButton: 'Cancel',
+        allowVerticalScrolling: true,
+    });
+    const result = await popup.show();
+    if (result !== POPUP_RESULT.AFFIRMATIVE) return null;
+
+    // The select still lives in popup.content while the popup is being closed.
+    const selectEl = popup.content?.querySelector?.('#lbx_diff_pick')
+        || document.querySelector('#lbx_diff_pick');
+    const idx = selectEl ? parseInt(/** @type {HTMLSelectElement} */(selectEl).value, 10) : 0;
+    return candidates[Number.isFinite(idx) ? idx : 0] ?? null;
 }
 
 function bindUi(root) {
