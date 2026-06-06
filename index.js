@@ -908,19 +908,29 @@ function entryCommentSummary(entry) {
     return c.length ? escapeHtml(c) : '<em class="lbx-diff-empty">(no title)</em>';
 }
 
-function renderAddedRemovedCard(entry, kind) {
+function renderAddedRemovedCard(entry, kind, options = {}) {
     const content = (entry?.content ?? '').toString();
     const safeContent = escapeHtml(content);
+    const editable = options.editable === true && kind === 'added';
+    const uid = entry?.uid;
+    const editArea = editable && uid !== undefined && uid !== null
+        ? `<div class="lbx-edit-area"><textarea data-lbx-uid="${escapeHtml(String(uid))}" data-lbx-original="${escapeHtml(content)}">${safeContent}</textarea></div>`
+        : '';
+    const toggle = editable
+        ? `<span class="lbx-edit-toggle" data-lbx-toggle="1"><i class="fa-solid fa-pen-to-square"></i> Edit</span>`
+        : '';
     return `
         <div class="lbx-diff-card ${kind}">
+            ${toggle}
             <div class="lbx-diff-comment">${entryCommentSummary(entry)}</div>
             <div class="lbx-diff-keys">keys: ${entryKeysSummary(entry)}</div>
-            ${content ? `<pre class="lbx-diff-content">${safeContent}</pre>` : ''}
+            ${content ? `<pre class="lbx-diff-content">${safeContent}</pre>` : (editable ? '<pre class="lbx-diff-content"><em class="lbx-diff-empty">(empty)</em></pre>' : '')}
+            ${editArea}
         </div>
     `;
 }
 
-function renderModifiedCard(oldEntry, newEntry, fields) {
+function renderModifiedCard(oldEntry, newEntry, fields, options = {}) {
     const includesContent = fields.includes('content');
     const otherFields = fields.filter(f => f !== 'content');
     const fieldsLine = otherFields.length
@@ -928,18 +938,31 @@ function renderModifiedCard(oldEntry, newEntry, fields) {
         : '';
     const contentBlock = includesContent
         ? `<pre class="lbx-diff-content">${renderContentDiff(oldEntry.content, newEntry.content)}</pre>`
+        : `<pre class="lbx-diff-content">${escapeHtml((newEntry.content ?? '').toString())}</pre>`;
+
+    const editable = options.editable === true;
+    const uid = newEntry?.uid;
+    const newContent = (newEntry?.content ?? '').toString();
+    const editArea = editable && uid !== undefined && uid !== null
+        ? `<div class="lbx-edit-area"><textarea data-lbx-uid="${escapeHtml(String(uid))}" data-lbx-original="${escapeHtml(newContent)}">${escapeHtml(newContent)}</textarea></div>`
         : '';
+    const toggle = editable
+        ? `<span class="lbx-edit-toggle" data-lbx-toggle="1"><i class="fa-solid fa-pen-to-square"></i> Edit</span>`
+        : '';
+
     return `
         <div class="lbx-diff-card modified">
+            ${toggle}
             <div class="lbx-diff-comment">${entryCommentSummary(newEntry)}</div>
             <div class="lbx-diff-keys">keys: ${entryKeysSummary(newEntry)}</div>
             ${fieldsLine}
             ${contentBlock}
+            ${editArea}
         </div>
     `;
 }
 
-function buildDiffHtml({ originalName, latestName, diff }) {
+function buildDiffHtml({ originalName, latestName, diff, editable = false }) {
     const a = diff.added.length;
     const r = diff.removed.length;
     const m = diff.modified.length;
@@ -954,6 +977,7 @@ function buildDiffHtml({ originalName, latestName, diff }) {
                 <span class="added">+${a}</span> added ·
                 <span class="removed">-${r}</span> removed ·
                 <span class="modified">~${m}</span> modified
+                <span class="lbx-diff-dirty-badge" data-lbx-dirty-badge></span>
             </div>
         </div>
     `;
@@ -967,7 +991,7 @@ function buildDiffHtml({ originalName, latestName, diff }) {
             <h3>Added (${a})</h3>
             ${a === 0
                 ? '<div class="lbx-diff-empty">None</div>'
-                : diff.added.map(e => renderAddedRemovedCard(e, 'added')).join('')}
+                : diff.added.map(e => renderAddedRemovedCard(e, 'added', { editable })).join('')}
         </div>
     `;
     const removedSection = `
@@ -975,7 +999,7 @@ function buildDiffHtml({ originalName, latestName, diff }) {
             <h3>Removed (${r})</h3>
             ${r === 0
                 ? '<div class="lbx-diff-empty">None</div>'
-                : diff.removed.map(e => renderAddedRemovedCard(e, 'removed')).join('')}
+                : diff.removed.map(e => renderAddedRemovedCard(e, 'removed', { editable: false })).join('')}
         </div>
     `;
     const modifiedSection = `
@@ -983,11 +1007,117 @@ function buildDiffHtml({ originalName, latestName, diff }) {
             <h3>Modified (${m})</h3>
             ${m === 0
                 ? '<div class="lbx-diff-empty">None</div>'
-                : diff.modified.map(x => renderModifiedCard(x.oldEntry, x.newEntry, x.fields)).join('')}
+                : diff.modified.map(x => renderModifiedCard(x.oldEntry, x.newEntry, x.fields, { editable })).join('')}
         </div>
     `;
 
     return header + addedSection + modifiedSection + removedSection;
+}
+
+// ----------------------------------------------------------- diff editing --
+
+/**
+ * Wire delegated click + input handlers for the editable diff dialog.
+ * - Click on .lbx-edit-toggle: toggle .lbx-editing on the parent card,
+ *   swap toggle label, focus the textarea on first edit.
+ * - Input on textarea[data-lbx-uid]: mark card dirty / undirty based on
+ *   comparison with data-lbx-original, then update the header badge.
+ *
+ * @param {HTMLElement} rootEl - The popup content container.
+ */
+function wireEditModeHandlers(rootEl) {
+    if (!rootEl) return;
+
+    rootEl.addEventListener('click', (ev) => {
+        const target = /** @type {HTMLElement} */ (ev.target);
+        const toggle = target.closest('[data-lbx-toggle]');
+        if (!toggle) return;
+        const card = toggle.closest('.lbx-diff-card');
+        if (!card) return;
+        const wasEditing = card.classList.contains('lbx-editing');
+        card.classList.toggle('lbx-editing');
+        // Update toggle label.
+        const editing = !wasEditing;
+        toggle.innerHTML = editing
+            ? '<i class="fa-solid fa-check"></i> Done'
+            : '<i class="fa-solid fa-pen-to-square"></i> Edit';
+        if (editing) {
+            const ta = /** @type {HTMLTextAreaElement | null} */ (card.querySelector('textarea[data-lbx-uid]'));
+            ta?.focus();
+        }
+    });
+
+    rootEl.addEventListener('input', (ev) => {
+        const target = /** @type {HTMLElement} */ (ev.target);
+        if (!(target instanceof HTMLTextAreaElement)) return;
+        if (!target.dataset.lbxUid) return;
+        const card = target.closest('.lbx-diff-card');
+        if (!card) return;
+        const original = target.dataset.lbxOriginal ?? '';
+        const dirty = target.value !== original;
+        if (dirty) {
+            card.setAttribute('data-dirty', 'true');
+        } else {
+            card.removeAttribute('data-dirty');
+        }
+        updateDirtyBadge(rootEl);
+    });
+}
+
+/** Update the "N edits pending" badge in the dialog header. */
+function updateDirtyBadge(rootEl) {
+    if (!rootEl) return;
+    const badge = rootEl.querySelector('[data-lbx-dirty-badge]');
+    if (!badge) return;
+    const dirty = rootEl.querySelectorAll('.lbx-diff-card[data-dirty="true"]').length;
+    badge.textContent = dirty === 0 ? '' : `· ${dirty} edit${dirty === 1 ? '' : 's'} pending`;
+}
+
+/**
+ * Apply every dirty textarea's value back into the sibling data object's
+ * matching entry.content. Returns a summary suitable for status reporting.
+ *
+ * @param {HTMLElement} rootEl - The popup content container.
+ * @param {{entries?: Record<string, any>}} siblingData
+ * @returns {{ changed: number, missing: string[] }}
+ */
+function applyEditsToSibling(rootEl, siblingData) {
+    const result = { changed: 0, missing: /** @type {string[]} */ ([]) };
+    if (!rootEl || !siblingData || typeof siblingData.entries !== 'object' || !siblingData.entries) {
+        return result;
+    }
+
+    // Build a uid -> storage-key lookup (uid as written on the entry, not the
+    // outer key, because they can differ).
+    const uidToKey = new Map();
+    for (const [storageKey, entry] of Object.entries(siblingData.entries)) {
+        if (!entry || typeof entry !== 'object') continue;
+        const uid = entry.uid;
+        if (uid === undefined || uid === null) continue;
+        uidToKey.set(String(uid), storageKey);
+    }
+
+    const dirtyAreas = rootEl.querySelectorAll('.lbx-diff-card[data-dirty="true"] textarea[data-lbx-uid]');
+    for (const node of dirtyAreas) {
+        const ta = /** @type {HTMLTextAreaElement} */ (node);
+        const uid = ta.dataset.lbxUid ?? '';
+        const newContent = ta.value;
+        const storageKey = uidToKey.get(uid);
+        if (storageKey === undefined) {
+            result.missing.push(uid);
+            continue;
+        }
+        const entry = siblingData.entries[storageKey];
+        if (!entry || typeof entry !== 'object') {
+            result.missing.push(uid);
+            continue;
+        }
+        if (entry.content !== newContent) {
+            entry.content = newContent;
+            result.changed++;
+        }
+    }
+    return result;
 }
 
 // --------------------------------------------------------------------- UI ---
@@ -1114,19 +1244,84 @@ async function onViewDiffClicked(event) {
             originalName,
             latestName: chosen.name,
             diff,
+            editable: true,
         });
 
         const Popup = ctx.Popup;
         const POPUP_TYPE = ctx.POPUP_TYPE;
-        if (!Popup || !POPUP_TYPE) {
+        const POPUP_RESULT = ctx.POPUP_RESULT;
+        if (!Popup || !POPUP_TYPE || !POPUP_RESULT) {
             throw new Error('SillyTavern Popup API is unavailable');
         }
+
+        // Track whether a save has been performed so we don't double-prompt for
+        // discard after a successful save.
+        let saved = false;
+
         const popup = new Popup(html, POPUP_TYPE.TEXT, '', {
             wide: true,
             large: true,
             okButton: 'Close',
             allowVerticalScrolling: true,
+            customButtons: [
+                {
+                    text: 'Save changes',
+                    result: POPUP_RESULT.CUSTOM1,
+                    appendAtEnd: false,
+                },
+            ],
+            onClosing: async (popupInstance, _result) => {
+                // popupInstance.result holds the resolved POPUP_RESULT value here.
+                const result = popupInstance?.result;
+                const root = popupInstance?.content;
+
+                // SAVE path: write edits, keep popup open if it fails, close if it succeeds.
+                if (result === POPUP_RESULT.CUSTOM1) {
+                    try {
+                        const summary = applyEditsToSibling(root, newData);
+                        if (summary.missing.length > 0) {
+                            console.warn(`[${MODULE_NAME}] Some edited entries could not be matched by uid:`, summary.missing);
+                        }
+                        if (summary.changed === 0) {
+                            toastr.info('No edits to save.', 'Lorebook Extender');
+                            // Don't close — let the user click Close explicitly.
+                            return false;
+                        }
+                        await ctx.saveWorldInfo(chosen.name, newData, true);
+                        saved = true;
+                        toastr.success(
+                            `Saved ${summary.changed} edit${summary.changed === 1 ? '' : 's'} to "${chosen.name}".`,
+                            'Lorebook Extender',
+                        );
+                        return true;
+                    } catch (err) {
+                        console.error(`[${MODULE_NAME}] Save failed:`, err);
+                        toastr.error(
+                            `Save failed: ${err?.message ?? err}`,
+                            'Lorebook Extender',
+                        );
+                        return false; // keep popup open
+                    }
+                }
+
+                // CLOSE path: confirm discard if there are unsaved edits.
+                if (!saved && root) {
+                    const dirty = root.querySelectorAll('.lbx-diff-card[data-dirty="true"]').length;
+                    if (dirty > 0) {
+                        const confirmed = await Popup.show.confirm(
+                            'Discard unsaved edits?',
+                            `${dirty} entr${dirty === 1 ? 'y has' : 'ies have'} pending edits that have not been saved.`,
+                        );
+                        if (confirmed !== POPUP_RESULT.AFFIRMATIVE) return false;
+                    }
+                }
+                return true;
+            },
         });
+
+        // Wire handlers AFTER the Popup constructor has built popup.content.
+        wireEditModeHandlers(popup.content);
+
         await popup.show();
     } catch (e) {
         const msg = (e && e.message) ? e.message : String(e);

@@ -147,3 +147,61 @@
     text-decoration: line-through;
     color: inherit;
 }
+
+/* ---- edit mode ---- */
+
+.lbx-diff-card .lbx-edit-toggle {
+    float: right;
+    cursor: pointer;
+    font-size: 0.85em;
+    opacity: 0.85;
+    user-select: none;
+}
+
+.lbx-diff-card .lbx-edit-toggle:hover {
+    opacity: 1;
+    text-decoration: underline;
+}
+
+.lbx-diff-card.lbx-editing .lbx-diff-content {
+    display: none;
+}
+
+.lbx-diff-card:not(.lbx-editing) .lbx-edit-area {
+    display: none;
+}
+
+.lbx-edit-area {
+    margin-top: 6px;
+}
+
+.lbx-edit-area textarea {
+    width: 100%;
+    min-height: 120px;
+    box-sizing: border-box;
+    font-family: var(--monoFontFamily, monospace);
+    font-size: 0.9em;
+    padding: 6px;
+    border-radius: 3px;
+}
+
+.lbx-diff-card[data-dirty="true"] {
+    box-shadow: inset 3px 0 0 var(--SmartThemeQuoteColor, #c9a227);
+}
+
+.lbx-diff-card[data-dirty="true"] .lbx-edit-toggle::after {
+    content: " (unsaved)";
+    color: var(--SmartThemeQuoteColor, #c9a227);
+}
+
+.lbx-diff-dirty-badge {
+    margin-left: 10px;
+    color: var(--SmartThemeQuoteColor, #c9a227);
+    font-family: var(--monoFontFamily, monospace);
+    font-size: 0.9em;
+    white-space: nowrap;
+}
+
+.lbx-diff-dirty-badge:empty {
+    display: none;
+}

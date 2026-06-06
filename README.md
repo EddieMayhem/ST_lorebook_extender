@@ -81,6 +81,14 @@ The button looks for sibling lorebooks of the character's currently linked one, 
 
 If at least one strict match exists, the newest one is used silently. If only loose/fuzzy candidates exist, you'll get a small picker popup to choose among them. If nothing matches, the browser console will log the full list of detected lorebooks so you can see what's actually there.
 
+### Editing the sibling
+
+Each *Added* and *Modified* entry card in the diff dialog has an **Edit** toggle in the top-right (it flips to **Done** while editing). Clicking it swaps the diff view for a textarea pre-filled with the sibling's current `content` text. Edit freely; cards with unsaved changes get a yellow stripe and an `(unsaved)` tag next to the toggle, and the header shows the count of pending edits.
+
+Click **Save changes** (in the dialog footer) to overwrite the sibling lorebook in place. The linked (base) lorebook and the character card link are never touched. Closing the dialog with unsaved edits prompts to discard.
+
+Only the `content` text is editable. Other fields (title, keys, order, etc.) stay as the LLM produced them — edit those via SillyTavern's standard world-info editor if needed. *Removed* cards remain read-only since those entries don't exist in the sibling.
+
 ## Requirements
 
 - A character must be selected, and that character must have a lorebook linked on its card (the *World/Lorebook* field on the character).

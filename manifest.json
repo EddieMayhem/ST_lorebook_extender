@@ -7,7 +7,7 @@
     "js": "index.js",
     "css": "style.css",
     "author": "ST_lorebook_extender contributors",
-    "version": "0.3.1",
+    "version": "0.4.0",
     "homePage": "",
     "auto_update": true,
     "minimum_client_version": "1.12.0"
