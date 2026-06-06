@@ -10,16 +10,69 @@
 
 // world-info.js is dynamically imported inside the pipeline so a missing/moved
 // internal module cannot fail the whole extension module load.
+//
+// ST serves third-party extensions at different URL depths depending on the
+// install mode (e.g. "/scripts/extensions/<name>/" vs
+// "/scripts/extensions/third-party/<name>/"). Instead of hardcoding a
+// relative path with the wrong number of "../", we resolve absolute candidate
+// URLs from the current module's URL and try them in order.
 let _worldInfoModulePromise = null;
-function loadWorldInfoModule() {
-    if (!_worldInfoModulePromise) {
-        // Served path: /scripts/extensions/third-party/<name>/index.js
-        // Target path: /scripts/world-info.js  => "../../world-info.js"
-        _worldInfoModulePromise = import('../../world-info.js').catch(err => {
-            _worldInfoModulePromise = null; // allow retry
-            throw err;
-        });
-    }
+
+function getWorldInfoCandidateUrls() {
+    /** @type {string[]} */
+    const candidates = [];
+
+    // Always absolute. The canonical location is /scripts/world-info.js.
+    try {
+        const origin = (typeof location !== 'undefined') ? location.origin : '';
+        if (origin) candidates.push(`${origin}/scripts/world-info.js`);
+    } catch { /* ignore */ }
+
+    // Resolve relative to this module's URL, walking up parents.
+    try {
+        // import.meta.url is e.g. http://host/scripts/extensions/<name>/index.js
+        const here = new URL(import.meta.url);
+        const parts = here.pathname.split('/').filter(Boolean);
+        // Walk up until we find a 'scripts' segment, then resolve to /scripts/world-info.js.
+        const scriptsIdx = parts.indexOf('scripts');
+        if (scriptsIdx !== -1) {
+            const base = '/' + parts.slice(0, scriptsIdx + 1).join('/');
+            candidates.push(`${here.origin}${base}/world-info.js`);
+        }
+        // Also try the two most common relative depths.
+        candidates.push(new URL('../../world-info.js', here).href);
+        candidates.push(new URL('../../../world-info.js', here).href);
+        candidates.push(new URL('../../../scripts/world-info.js', here).href);
+        candidates.push(new URL('../../scripts/world-info.js', here).href);
+    } catch { /* ignore */ }
+
+    // De-duplicate while preserving order.
+    return Array.from(new Set(candidates));
+}
+
+async function loadWorldInfoModule() {
+    if (_worldInfoModulePromise) return _worldInfoModulePromise;
+
+    const candidates = getWorldInfoCandidateUrls();
+    _worldInfoModulePromise = (async () => {
+        const errors = [];
+        for (const url of candidates) {
+            try {
+                /* webpackIgnore: true */
+                const mod = await import(/* @vite-ignore */ url);
+                if (mod && typeof mod.createNewWorldInfo === 'function' && typeof mod.deleteWorldInfo === 'function') {
+                    console.debug(`[lorebook_extender] Loaded world-info.js from ${url}`);
+                    return mod;
+                }
+                errors.push(`${url}: loaded but missing expected exports`);
+            } catch (e) {
+                errors.push(`${url}: ${e?.message || e}`);
+            }
+        }
+        const err = new Error('Could not locate SillyTavern world-info.js. Tried:\n' + errors.join('\n'));
+        _worldInfoModulePromise = null; // allow retry next click
+        throw err;
+    })();
     return _worldInfoModulePromise;
 }
 
