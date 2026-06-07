@@ -60,10 +60,23 @@ async function getWorldInfoNamesCompat(ctx) {
         const data = await response.json().catch(() => null);
         if (!Array.isArray(data)) return [];
         // Each row is { file_id, name, extensions }. world_names (the binding
-        // the native getter mirrors) uses file_id; prefer that for parity.
-        return data
-            .map(entry => (entry && typeof entry === 'object') ? (entry.file_id ?? entry.name) : null)
-            .filter(n => typeof n === 'string' && n.length > 0);
+        // the native getter mirrors) uses file_id, so prefer that — but also
+        // include the user-facing `name` when it differs, so case/whitespace
+        // drift between the on-disk filename and the in-app display name
+        // doesn't cause us to miss a perfectly valid sibling.
+        const out = [];
+        const seenLower = new Set();
+        for (const entry of data) {
+            if (!entry || typeof entry !== 'object') continue;
+            for (const candidate of [entry.file_id, entry.name]) {
+                if (typeof candidate !== 'string' || !candidate.length) continue;
+                const key = candidate.toLowerCase();
+                if (seenLower.has(key)) continue;
+                seenLower.add(key);
+                out.push(candidate);
+            }
+        }
+        return out;
     } catch (e) {
         console.warn(`[${MODULE_NAME}] /api/worldinfo/list fetch failed:`, e);
         return [];
@@ -81,8 +94,11 @@ async function createEmptyWorldInfo(name) {
     if (!name || typeof name !== 'string') return false;
     // Check overwrite up front; createNewWorldInfo would prompt interactively,
     // we just refuse silently and let the caller pick a different name.
+    // Case-insensitive: ST persists worlds as files on disk, and filesystems
+    // on Windows/macOS are case-insensitive — so "Foo" and "foo" would collide.
     const existing = await getWorldInfoNamesCompat(ctx);
-    if (existing.includes(name)) return false;
+    const target = name.toLowerCase();
+    if (existing.some(n => n.toLowerCase() === target)) return false;
     await ctx.saveWorldInfo(name, { entries: {} }, true);
     await ctx.updateWorldInfoList?.();
     return true;
@@ -668,11 +684,14 @@ async function runExtendPipeline() {
     // cleanup pass below. Avoids a duplicate REST round-trip on older ST builds
     // where ctx.getWorldInfoNames doesn't exist (added 2026-04-23, PR #5505).
     let knownNames = await getWorldInfoNamesCompat(ctx);
-    const existing = new Set(knownNames);
-    if (existing.has(newName)) {
+    // Case-insensitive collision check: on Windows/macOS the on-disk filesystem
+    // is case-insensitive, so "Foo - 2026" and "foo - 2026" would clobber each
+    // other server-side even though the JS Set would treat them as distinct.
+    const existingLower = new Set(knownNames.map(n => n.toLowerCase()));
+    if (existingLower.has(newName.toLowerCase())) {
         for (let counter = 2; counter < 1000; counter++) {
             const candidate = `${newName}-${counter}`;
-            if (!existing.has(candidate)) { newName = candidate; break; }
+            if (!existingLower.has(candidate.toLowerCase())) { newName = candidate; break; }
         }
     }
 
@@ -687,14 +706,21 @@ async function runExtendPipeline() {
     // 8. Cleanup. Find siblings = anything with the exact "<original> - " prefix
     // whose remainder parses as our timestamp format.
     // Re-fetch the list so the just-created lorebook is included (and any
-    // concurrent edits since step 6 are reflected).
+    // concurrent edits since step 6 are reflected). Case-insensitive matching
+    // mirrors findSiblingCandidates so cleanup works even if the character
+    // card's `extensions.world` value drifts in case from the on-disk file_id.
     knownNames = await getWorldInfoNamesCompat(ctx);
-    const prefix = `${originalName} - `;
+    const origLowerCleanup = String(originalName).toLowerCase();
+    const prefixLower = `${origLowerCleanup} - `;
+    const newNameLower = newName.toLowerCase();
     const limit = Math.max(1, Number(settings.maxVersions) || 5);
     const siblings = knownNames
-        .filter(n => n !== originalName && n.startsWith(prefix))
+        .filter(n => {
+            const nl = n.toLowerCase();
+            return nl !== origLowerCleanup && nl.startsWith(prefixLower);
+        })
         .map(n => {
-            const rawSuffix = n.slice(prefix.length);
+            const rawSuffix = n.slice(prefixLower.length);
             // Try the full suffix first; only strip a trailing "-N" collision counter
             // as a fallback, because the timestamp itself ends with "-NN" (seconds).
             let ts = parseStampSuffix(rawSuffix, settings.dateFormat);
@@ -710,7 +736,7 @@ async function runExtendPipeline() {
     let deleted = 0;
     while (siblings.length > limit) {
         const victim = siblings.shift();
-        if (victim.name === newName) continue; // never delete the one we just made
+        if (victim.name.toLowerCase() === newNameLower) continue; // never delete the one we just made
         try {
             const ok = await deleteWorldInfoFile(victim.name);
             if (ok !== false) deleted++;
@@ -760,21 +786,37 @@ async function findLatestSibling(originalName, dateFormat) {
  * Within each tier, strict is sorted by parsed timestamp desc; loose/fuzzy are
  * sorted by name desc (so ISO-ish suffixes still come out newest-first).
  *
+ * Matching is case-insensitive: on Windows + macOS the underlying filesystem
+ * is case-insensitive, and the character card's `extensions.world` field has
+ * been observed to drift in case from the actual on-disk file_id (e.g. after
+ * a manual rename). The returned `name` field always preserves the casing as
+ * reported by SillyTavern so subsequent loadWorldInfo / saveWorldInfo calls
+ * still address the correct file.
+ *
  * @returns {Promise<Array<{ name: string, ts: number|null, tier: 'strict'|'loose'|'fuzzy' }>>}
  */
 async function findSiblingCandidates(originalName, dateFormat) {
     const ctx = SillyTavern.getContext();
-    const names = (await getWorldInfoNamesCompat(ctx)).filter(n => n !== originalName);
-    if (!originalName || !names.length) return [];
+    const rawNames = await getWorldInfoNamesCompat(ctx);
+    if (!originalName || !rawNames.length) return [];
+
+    const origLower = String(originalName).toLowerCase();
+    // Filter out exact (case-insensitive) self-matches.
+    const names = rawNames.filter(n => n.toLowerCase() !== origLower);
+    if (!names.length) return [];
 
     const strict = [];
     const loose = [];
     const fuzzy = [];
 
-    const sepPrefix = `${originalName} - `;
+    const sepPrefixLower = `${origLower} - `;
     for (const n of names) {
-        if (n.startsWith(sepPrefix)) {
-            const rawSuffix = n.slice(sepPrefix.length);
+        const nLower = n.toLowerCase();
+        if (nLower.startsWith(sepPrefixLower)) {
+            // Slice off the prefix using the lower-cased length, then read the
+            // suffix from the ORIGINAL string at the same offset to keep its
+            // casing intact (matters for timestamp parsing? no — but cheap).
+            const rawSuffix = n.slice(sepPrefixLower.length);
             // Try the full suffix first; only strip a trailing counter (e.g. "-2") as a fallback,
             // because our own timestamp itself ends with "-NN" (seconds).
             let ts = parseStampSuffix(rawSuffix, dateFormat);
@@ -787,7 +829,7 @@ async function findSiblingCandidates(originalName, dateFormat) {
             } else {
                 loose.push({ name: n, ts: null, tier: 'loose' });
             }
-        } else if (n.startsWith(originalName)) {
+        } else if (nLower.startsWith(origLower)) {
             // No " - " separator, but the original is a prefix. Common for
             // hand-named exports like "<name>_2026-06-06" or "<name>(v2)".
             fuzzy.push({ name: n, ts: null, tier: 'fuzzy' });
@@ -799,6 +841,50 @@ async function findSiblingCandidates(originalName, dateFormat) {
     fuzzy.sort((a, b) => b.name.localeCompare(a.name));
 
     return [...strict, ...loose, ...fuzzy];
+}
+
+/**
+ * Rank every lorebook name by how plausibly it could be a sibling of
+ * `originalName`. Purely diagnostic — used when we want to tell the user
+ * "we didn't find a sibling, but here's what's closest" without spamming the
+ * full list. Score is in [0, 1] where 1 is identical (case-insensitive) and
+ * 0 shares no leading characters.
+ *
+ * Two signals are combined:
+ *   - shared lowercase prefix length / max length  (primary, weight 0.7)
+ *   - lowercase substring containment              (secondary, weight 0.3)
+ *
+ * @param {string} originalName
+ * @param {string[]} allNames
+ * @returns {Array<{ name: string, score: number }>}
+ */
+function rankProbableSiblings(originalName, allNames) {
+    const origLower = String(originalName ?? '').toLowerCase();
+    if (!origLower || !Array.isArray(allNames) || !allNames.length) return [];
+
+    /** @param {string} a @param {string} b */
+    const sharedPrefixLen = (a, b) => {
+        const max = Math.min(a.length, b.length);
+        let i = 0;
+        while (i < max && a.charCodeAt(i) === b.charCodeAt(i)) i++;
+        return i;
+    };
+
+    const ranked = allNames
+        .filter(n => n.toLowerCase() !== origLower) // exclude self (case-insensitive)
+        .map(n => {
+            const nl = n.toLowerCase();
+            const prefix = sharedPrefixLen(nl, origLower);
+            const longer = Math.max(nl.length, origLower.length);
+            const prefixScore = longer === 0 ? 0 : prefix / longer;
+            const containsScore = (nl.includes(origLower) || origLower.includes(nl)) ? 1 : 0;
+            const score = 0.7 * prefixScore + 0.3 * containsScore;
+            return { name: n, score };
+        })
+        .filter(r => r.score > 0)
+        .sort((a, b) => b.score - a.score);
+
+    return ranked;
 }
 
 /** Shallow-equal for arrays (string elements expected). */
@@ -1390,13 +1476,39 @@ async function onViewDiffClicked(event) {
         const candidates = await findSiblingCandidates(originalName, settings.dateFormat);
         if (candidates.length === 0) {
             const allNames = await getWorldInfoNamesCompat(ctx);
-            const sample = allNames.slice(0, 20).map(n => `  • ${n}`).join('\n');
-            const more = allNames.length > 20 ? `\n  …and ${allNames.length - 20} more` : '';
-            console.warn(`[${MODULE_NAME}] No siblings found for "${originalName}". Existing books:\n${sample}${more}`);
+            // Rank existing books by how plausibly they could be siblings, so
+            // the user can immediately see whether there's a typo / case
+            // mismatch / wrong "base lorebook" link on the character card.
+            const ranked = rankProbableSiblings(originalName, allNames);
+            const topMatches = ranked.slice(0, 5);
+            const tail = allNames
+                .filter(n => !topMatches.some(t => t.name === n))
+                .slice(0, 10);
+
+            const matchesLine = topMatches.length
+                ? topMatches.map(m => `  • ${m.name}  (similarity ${m.score.toFixed(2)})`).join('\n')
+                : '  (none)';
+            const tailLine = tail.length ? `\nOther lorebooks (${allNames.length} total):\n` + tail.map(n => `  • ${n}`).join('\n') : '';
+
+            console.warn(
+                `[${MODULE_NAME}] No siblings found.\n` +
+                `Looking for sibling of: "${originalName}"\n` +
+                `(this is what the character card has linked as its primary lorebook)\n\n` +
+                `Closest matches:\n${matchesLine}${tailLine}\n\n` +
+                `A "sibling" must be a lorebook whose name starts with "${originalName}". ` +
+                `If your sibling has a different name, either rename it or change the ` +
+                `character card's linked lorebook to the matching base.`,
+            );
+
+            // Show the closest match (if any) in the toast itself so the user
+            // doesn't always need to open devtools.
+            const hint = topMatches.length
+                ? `\nClosest existing: "${topMatches[0].name}"`
+                : '';
             toastr.info(
-                `No sibling of "${originalName}" found.\nSee browser console for the list of detected lorebooks.`,
+                `No sibling of "${originalName}" found among ${allNames.length} lorebook${allNames.length === 1 ? '' : 's'}.${hint}\nSee browser console for details.`,
                 'Lorebook Extender',
-                { timeOut: 8000 },
+                { timeOut: 10000 },
             );
             return;
         }

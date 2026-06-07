@@ -115,7 +115,21 @@ Only `key` and `content` are editable here. Other fields (title, secondary keys,
 
 **`[object Event]` failure to load.** Almost always a path-resolution problem in an older version of this extension. Update to ≥ 0.2.0, which no longer depends on relative imports to ST internals.
 
-**"No sibling of `<name>` found" when *View latest diff* is clicked.** Either no extended version has been produced yet (click *Extend Lorebook Now* first), or you're on a version older than 0.3.1 where the sibling-detection parser had an off-by-one bug that misclassified its own output. Update to ≥ 0.3.1 and hard-refresh. The browser console will log every lorebook name the extension can see if you need to debug further.
+**"No sibling of `<name>` found" when *View latest diff* is clicked.**
+
+The toast and browser console now show:
+
+1. The exact lorebook name the extension is looking for a sibling of (this is what the character card has linked as its primary lorebook — check it for typos).
+2. The top 5 lorebooks ranked by name similarity, with similarity scores.
+3. A sample of the other lorebooks ST has registered.
+
+Most common causes:
+
+- **No extended version has been produced yet** — click *Extend Lorebook Now* first.
+- **The character card's linked lorebook doesn't match your real "base" name** — fix the link on the character card, or rename your sibling so it starts with the linked base name.
+- **Older `< 0.3.1` extension version** had an off-by-one parser bug that misclassified its own output. Update + hard-refresh.
+- **Older `< 0.4.1` extension** silently returned empty on SillyTavern builds older than 2026-04-23 (before `ctx.getWorldInfoNames()` was added). Update + hard-refresh.
+- **Case mismatch** between the character card link and the on-disk filename. As of 0.4.2 the matching is case-insensitive, so update if you're on an older build.
 
 ## License
 
