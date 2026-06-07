@@ -283,6 +283,18 @@ function simpleHash(str) {
 
 /**
  * Render visible chat messages into a plain-text transcript.
+ *
+ * Filtering rules:
+ *   - `is_system`     — ST internal system notes (welcome banners, /sys output).
+ *   - `is_hidden`     — user explicitly /hide'd these so the model "forgets" them.
+ *   - `extra.isHidden` — older builds + some extensions write the flag here instead.
+ * Sending any of these would defeat the user's intent (system noise polluting
+ * the diff, or hidden context leaking back into the next LLM call).
+ *
+ * Swipes: each character message stores its active alternative in `msg.mes`,
+ * and ST keeps `mes` in sync with `swipe_id` automatically. So reading `msg.mes`
+ * is correct — no special-casing of `msg.swipes` needed.
+ *
  * @param {Array<any>} messages
  * @returns {string}
  */
@@ -291,7 +303,11 @@ function renderChatTranscript(messages) {
     for (const msg of messages) {
         if (!msg) continue;
         if (msg.is_system) continue;
-        const name = (msg.name ?? (msg.is_user ? 'User' : 'Character')).toString().trim();
+        if (msg.is_hidden) continue;
+        if (msg.extra && msg.extra.isHidden) continue;
+        // `||` instead of `??` so an empty-string name still falls through to the
+        // user/character default; `??` would let "" through and produce ": text".
+        const name = (msg.name || (msg.is_user ? 'User' : 'Character')).toString().trim();
         const body = (msg.mes ?? '').toString().trim();
         if (!body) continue;
         lines.push(`${name}: ${body}`);
@@ -629,8 +645,33 @@ async function runExtendPipeline() {
     }
 
     // 2. Build diff.
-    const snapshot = ctx.chatMetadata?.[SNAPSHOT_KEY] || null;
+    let snapshot = ctx.chatMetadata?.[SNAPSHOT_KEY] || null;
     const totalLen = ctx.chat.length;
+
+    // Validate the snapshot against the current chat. If the chat is shorter
+    // than the snapshot expects, or the recorded chat-length doesn't match
+    // any plausible state (deletions, /del, branch switch, partial swipe
+    // rollback), treat the snapshot as invalidated and fall through to the
+    // "no snapshot" branch — otherwise startIndex math points into thin air
+    // and we'd silently feed the LLM the wrong slice (or, worse, an empty
+    // diff that we then snapshot-advance off of).
+    if (snapshot) {
+        const lastIdx = Number(snapshot.lastProcessedIndex);
+        const recordedLen = Number(snapshot.chatLength);
+        const isStale =
+            !Number.isFinite(lastIdx)
+            || lastIdx < 0
+            || lastIdx >= totalLen
+            || (Number.isFinite(recordedLen) && recordedLen > totalLen);
+        if (isStale) {
+            console.warn(
+                `[${MODULE_NAME}] Snapshot invalidated: lastProcessedIndex=${snapshot.lastProcessedIndex}, `
+                + `recorded chatLength=${snapshot.chatLength}, actual chat length=${totalLen}. `
+                + `Treating this run as if no snapshot existed.`,
+            );
+            snapshot = null;
+        }
+    }
 
     /** @type {Array<any>} */
     let diffMessages;
@@ -768,40 +809,50 @@ async function runExtendPipeline() {
     // We use the resolved base name here, not the (possibly already-timestamped)
     // linked name, otherwise cleanup looks for siblings of a sibling and
     // silently prunes nothing.
-    knownNames = await getWorldInfoNamesCompat(ctx);
-    const origLowerCleanup = String(baseName).toLowerCase();
-    const prefixLower = `${origLowerCleanup} - `;
-    const newNameLower = newName.toLowerCase();
-    const limit = Math.max(1, Number(settings.maxVersions) || 5);
-    const siblings = knownNames
-        .filter(n => {
-            const nl = n.toLowerCase();
-            return nl !== origLowerCleanup && nl.startsWith(prefixLower);
-        })
-        .map(n => {
-            const rawSuffix = n.slice(prefixLower.length);
-            // Try the full suffix first; only strip a trailing "-N" collision counter
-            // as a fallback, because the timestamp itself ends with "-NN" (seconds).
-            let ts = parseStampSuffix(rawSuffix, settings.dateFormat);
-            if (ts === null) {
-                const stripped = rawSuffix.replace(/-\d+$/, '');
-                if (stripped !== rawSuffix) ts = parseStampSuffix(stripped, settings.dateFormat);
-            }
-            return ts === null ? null : { name: n, ts };
-        })
-        .filter(Boolean)
-        .sort((a, b) => a.ts - b.ts);
-
+    //
+    // The whole block is wrapped: if the world-info list fetch (or anything
+    // else here) throws, we still want step 9 to advance the snapshot, because
+    // the LLM call already succeeded and the new lorebook is already saved.
+    // Otherwise the user would see an error toast, re-run, and pay for the
+    // same diff twice.
     let deleted = 0;
-    while (siblings.length > limit) {
-        const victim = siblings.shift();
-        if (victim.name.toLowerCase() === newNameLower) continue; // never delete the one we just made
-        try {
-            const ok = await deleteWorldInfoFile(victim.name);
-            if (ok !== false) deleted++;
-        } catch (e) {
-            console.warn(`[${MODULE_NAME}] Failed to delete "${victim.name}":`, e);
+    try {
+        knownNames = await getWorldInfoNamesCompat(ctx);
+        const origLowerCleanup = String(baseName).toLowerCase();
+        const prefixLower = `${origLowerCleanup} - `;
+        const newNameLower = newName.toLowerCase();
+        const limit = Math.max(1, Number(settings.maxVersions) || 5);
+        const siblings = knownNames
+            .filter(n => {
+                const nl = n.toLowerCase();
+                return nl !== origLowerCleanup && nl.startsWith(prefixLower);
+            })
+            .map(n => {
+                const rawSuffix = n.slice(prefixLower.length);
+                // Try the full suffix first; only strip a trailing "-N" collision counter
+                // as a fallback, because the timestamp itself ends with "-NN" (seconds).
+                let ts = parseStampSuffix(rawSuffix, settings.dateFormat);
+                if (ts === null) {
+                    const stripped = rawSuffix.replace(/-\d+$/, '');
+                    if (stripped !== rawSuffix) ts = parseStampSuffix(stripped, settings.dateFormat);
+                }
+                return ts === null ? null : { name: n, ts };
+            })
+            .filter(Boolean)
+            .sort((a, b) => a.ts - b.ts);
+
+        while (siblings.length > limit) {
+            const victim = siblings.shift();
+            if (victim.name.toLowerCase() === newNameLower) continue; // never delete the one we just made
+            try {
+                const ok = await deleteWorldInfoFile(victim.name);
+                if (ok !== false) deleted++;
+            } catch (e) {
+                console.warn(`[${MODULE_NAME}] Failed to delete "${victim.name}":`, e);
+            }
         }
+    } catch (e) {
+        console.warn(`[${MODULE_NAME}] Sibling cleanup failed (continuing; snapshot will still advance):`, e);
     }
 
     // 9. Update snapshot for this chat.
@@ -811,6 +862,11 @@ async function runExtendPipeline() {
         lastProcessedIndex: lastIndex,
         lastProcessedAt: Date.now(),
         lastProcessedHash: simpleHash(lastMes),
+        // Recorded chat length lets the next run detect deletions/truncation
+        // (e.g. /del, branch switch) — if the chat later shrinks below this
+        // value, the snapshot is treated as invalidated rather than blindly
+        // sliced from a stale index.
+        chatLength: totalLen,
         // Always store the resolved base so this value stays stable across
         // runs even after the character card gets relinked to a timestamped
         // sibling. Avoids confusing "sourceLorebook" drift in saved metadata.
