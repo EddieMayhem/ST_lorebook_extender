@@ -15,6 +15,62 @@
 // getContext() or reachable via the documented HTTP API with getRequestHeaders().
 
 /**
+ * Compatibility wrapper around getContext().getWorldInfoNames().
+ *
+ * That helper was only added to SillyTavern on 2026-04-23 (PR #5505). On
+ * older builds the synchronous path is missing entirely, which manifests as
+ * "ctx.getWorldInfoNames is not a function" — and on the extend pipeline
+ * the crash happens *after* a successful (and possibly expensive) LLM call.
+ *
+ * Strategy:
+ *   1. Prefer the native getter when it exists (no network, instant).
+ *   2. Fall back to POST /api/worldinfo/list (a stable, long-lived endpoint
+ *      we already rely on indirectly via /api/worldinfo/delete).
+ *   3. Never throw. Worst case: log + return [] so callers behave as if no
+ *      lorebooks exist, which is the same degraded-but-survivable state the
+ *      old optional-chained calls already produced.
+ *
+ * @param {ReturnType<typeof SillyTavern.getContext>} [ctx]
+ * @returns {Promise<string[]>}
+ */
+async function getWorldInfoNamesCompat(ctx) {
+    const context = ctx ?? SillyTavern.getContext();
+
+    if (typeof context.getWorldInfoNames === 'function') {
+        try {
+            const names = context.getWorldInfoNames();
+            return Array.isArray(names) ? names.filter(n => typeof n === 'string') : [];
+        } catch (e) {
+            console.warn(`[${MODULE_NAME}] ctx.getWorldInfoNames() threw, falling back to REST:`, e);
+        }
+    }
+
+    // REST fallback for older SillyTavern builds.
+    try {
+        const headers = typeof context.getRequestHeaders === 'function' ? context.getRequestHeaders() : {};
+        const response = await fetch('/api/worldinfo/list', {
+            method: 'POST',
+            headers,
+        });
+        if (!response.ok) {
+            const text = await response.text().catch(() => '');
+            console.warn(`[${MODULE_NAME}] /api/worldinfo/list ${response.status}: ${text}`);
+            return [];
+        }
+        const data = await response.json().catch(() => null);
+        if (!Array.isArray(data)) return [];
+        // Each row is { file_id, name, extensions }. world_names (the binding
+        // the native getter mirrors) uses file_id; prefer that for parity.
+        return data
+            .map(entry => (entry && typeof entry === 'object') ? (entry.file_id ?? entry.name) : null)
+            .filter(n => typeof n === 'string' && n.length > 0);
+    } catch (e) {
+        console.warn(`[${MODULE_NAME}] /api/worldinfo/list fetch failed:`, e);
+        return [];
+    }
+}
+
+/**
  * Create a new (empty) world info file. Mirrors createNewWorldInfo() from
  * scripts/world-info.js, but only uses getContext-exposed surface.
  * @param {string} name
@@ -25,7 +81,7 @@ async function createEmptyWorldInfo(name) {
     if (!name || typeof name !== 'string') return false;
     // Check overwrite up front; createNewWorldInfo would prompt interactively,
     // we just refuse silently and let the caller pick a different name.
-    const existing = ctx.getWorldInfoNames?.() ?? [];
+    const existing = await getWorldInfoNamesCompat(ctx);
     if (existing.includes(name)) return false;
     await ctx.saveWorldInfo(name, { entries: {} }, true);
     await ctx.updateWorldInfoList?.();
@@ -608,7 +664,11 @@ async function runExtendPipeline() {
 
     // 6. Pick a free name.
     let newName = `${originalName} - ${formatStamp(settings.dateFormat)}`;
-    const existing = new Set(ctx.getWorldInfoNames());
+    // Fetch the lorebook list once and reuse for both name collision and the
+    // cleanup pass below. Avoids a duplicate REST round-trip on older ST builds
+    // where ctx.getWorldInfoNames doesn't exist (added 2026-04-23, PR #5505).
+    let knownNames = await getWorldInfoNamesCompat(ctx);
+    const existing = new Set(knownNames);
     if (existing.has(newName)) {
         for (let counter = 2; counter < 1000; counter++) {
             const candidate = `${newName}-${counter}`;
@@ -626,9 +686,12 @@ async function runExtendPipeline() {
 
     // 8. Cleanup. Find siblings = anything with the exact "<original> - " prefix
     // whose remainder parses as our timestamp format.
+    // Re-fetch the list so the just-created lorebook is included (and any
+    // concurrent edits since step 6 are reflected).
+    knownNames = await getWorldInfoNamesCompat(ctx);
     const prefix = `${originalName} - `;
     const limit = Math.max(1, Number(settings.maxVersions) || 5);
-    const siblings = ctx.getWorldInfoNames()
+    const siblings = knownNames
         .filter(n => n !== originalName && n.startsWith(prefix))
         .map(n => {
             const rawSuffix = n.slice(prefix.length);
@@ -682,8 +745,8 @@ async function runExtendPipeline() {
  * Returns { name, ts } of the newest strict match, or null if none exist.
  * Uses the same matching logic as the cleanup step in the extend pipeline.
  */
-function findLatestSibling(originalName, dateFormat) {
-    const candidates = findSiblingCandidates(originalName, dateFormat);
+async function findLatestSibling(originalName, dateFormat) {
+    const candidates = await findSiblingCandidates(originalName, dateFormat);
     const strict = candidates.find(c => c.tier === 'strict');
     return strict ?? null;
 }
@@ -697,11 +760,11 @@ function findLatestSibling(originalName, dateFormat) {
  * Within each tier, strict is sorted by parsed timestamp desc; loose/fuzzy are
  * sorted by name desc (so ISO-ish suffixes still come out newest-first).
  *
- * @returns {Array<{ name: string, ts: number|null, tier: 'strict'|'loose'|'fuzzy' }>}
+ * @returns {Promise<Array<{ name: string, ts: number|null, tier: 'strict'|'loose'|'fuzzy' }>>}
  */
-function findSiblingCandidates(originalName, dateFormat) {
+async function findSiblingCandidates(originalName, dateFormat) {
     const ctx = SillyTavern.getContext();
-    const names = (ctx.getWorldInfoNames?.() ?? []).filter(n => n !== originalName);
+    const names = (await getWorldInfoNamesCompat(ctx)).filter(n => n !== originalName);
     if (!originalName || !names.length) return [];
 
     const strict = [];
@@ -903,6 +966,44 @@ function entryKeysSummary(entry) {
     return escapeHtml(JSON.stringify(keys));
 }
 
+/**
+ * Serialise an entry.key array into the comma-separated form used in the
+ * editable input. Strips falsy entries but otherwise leaves whitespace alone
+ * so a round-trip with no edits is a no-op.
+ *
+ * @param {unknown} keyField
+ * @returns {string}
+ */
+function keysToEditableString(keyField) {
+    const keys = Array.isArray(keyField) ? keyField : [];
+    return keys
+        .map(k => (k === null || k === undefined) ? '' : String(k))
+        .filter(k => k.length > 0)
+        .join(', ');
+}
+
+/**
+ * Parse the comma-separated form back into a string array. Trims each token,
+ * drops empties, and dedupes while preserving first-seen order. Mirrors how
+ * the SillyTavern world-info editor itself treats key inputs.
+ *
+ * @param {string} raw
+ * @returns {string[]}
+ */
+function parseEditableKeysString(raw) {
+    if (typeof raw !== 'string') return [];
+    const seen = new Set();
+    const out = [];
+    for (const piece of raw.split(',')) {
+        const trimmed = piece.trim();
+        if (!trimmed) continue;
+        if (seen.has(trimmed)) continue;
+        seen.add(trimmed);
+        out.push(trimmed);
+    }
+    return out;
+}
+
 function entryCommentSummary(entry) {
     const c = (entry?.comment ?? '').toString().trim();
     return c.length ? escapeHtml(c) : '<em class="lbx-diff-empty">(no title)</em>';
@@ -913,8 +1014,16 @@ function renderAddedRemovedCard(entry, kind, options = {}) {
     const safeContent = escapeHtml(content);
     const editable = options.editable === true && kind === 'added';
     const uid = entry?.uid;
-    const editArea = editable && uid !== undefined && uid !== null
-        ? `<div class="lbx-edit-area"><textarea data-lbx-uid="${escapeHtml(String(uid))}" data-lbx-original="${escapeHtml(content)}">${safeContent}</textarea></div>`
+    const hasUid = uid !== undefined && uid !== null;
+    const safeUid = hasUid ? escapeHtml(String(uid)) : '';
+    const keysString = keysToEditableString(entry?.key);
+    const editArea = editable && hasUid
+        ? `<div class="lbx-edit-area">
+                <label class="lbx-edit-label">Keys (comma-separated triggers)</label>
+                <input type="text" class="lbx-edit-keys" data-lbx-keys-uid="${safeUid}" data-lbx-keys-original="${escapeHtml(keysString)}" value="${escapeHtml(keysString)}" placeholder="key1, key2, key3" />
+                <label class="lbx-edit-label">Content</label>
+                <textarea data-lbx-uid="${safeUid}" data-lbx-original="${escapeHtml(content)}">${safeContent}</textarea>
+            </div>`
         : '';
     const toggle = editable
         ? `<span class="lbx-edit-toggle" data-lbx-toggle="1"><i class="fa-solid fa-pen-to-square"></i> Edit</span>`
@@ -942,9 +1051,17 @@ function renderModifiedCard(oldEntry, newEntry, fields, options = {}) {
 
     const editable = options.editable === true;
     const uid = newEntry?.uid;
+    const hasUid = uid !== undefined && uid !== null;
+    const safeUid = hasUid ? escapeHtml(String(uid)) : '';
     const newContent = (newEntry?.content ?? '').toString();
-    const editArea = editable && uid !== undefined && uid !== null
-        ? `<div class="lbx-edit-area"><textarea data-lbx-uid="${escapeHtml(String(uid))}" data-lbx-original="${escapeHtml(newContent)}">${escapeHtml(newContent)}</textarea></div>`
+    const keysString = keysToEditableString(newEntry?.key);
+    const editArea = editable && hasUid
+        ? `<div class="lbx-edit-area">
+                <label class="lbx-edit-label">Keys (comma-separated triggers)</label>
+                <input type="text" class="lbx-edit-keys" data-lbx-keys-uid="${safeUid}" data-lbx-keys-original="${escapeHtml(keysString)}" value="${escapeHtml(keysString)}" placeholder="key1, key2, key3" />
+                <label class="lbx-edit-label">Content</label>
+                <textarea data-lbx-uid="${safeUid}" data-lbx-original="${escapeHtml(newContent)}">${escapeHtml(newContent)}</textarea>
+            </div>`
         : '';
     const toggle = editable
         ? `<span class="lbx-edit-toggle" data-lbx-toggle="1"><i class="fa-solid fa-pen-to-square"></i> Edit</span>`
@@ -1022,6 +1139,8 @@ function buildDiffHtml({ originalName, latestName, diff, editable = false }) {
  *   swap toggle label, focus the textarea on first edit.
  * - Input on textarea[data-lbx-uid]: mark card dirty / undirty based on
  *   comparison with data-lbx-original, then update the header badge.
+ * - Input on input[data-lbx-keys-uid]: same dirty tracking, but compares
+ *   parsed key arrays so cosmetic whitespace/comma noise doesn't flag it.
  *
  * @param {HTMLElement} rootEl - The popup content container.
  */
@@ -1042,26 +1161,63 @@ function wireEditModeHandlers(rootEl) {
             ? '<i class="fa-solid fa-check"></i> Done'
             : '<i class="fa-solid fa-pen-to-square"></i> Edit';
         if (editing) {
+            // Prefer the keys input on first edit so users see/realise it's
+            // editable; fall back to the content textarea otherwise.
+            const keysInput = /** @type {HTMLInputElement | null} */ (card.querySelector('input[data-lbx-keys-uid]'));
             const ta = /** @type {HTMLTextAreaElement | null} */ (card.querySelector('textarea[data-lbx-uid]'));
-            ta?.focus();
+            (keysInput ?? ta)?.focus();
         }
     });
 
     rootEl.addEventListener('input', (ev) => {
         const target = /** @type {HTMLElement} */ (ev.target);
-        if (!(target instanceof HTMLTextAreaElement)) return;
-        if (!target.dataset.lbxUid) return;
-        const card = target.closest('.lbx-diff-card');
-        if (!card) return;
-        const original = target.dataset.lbxOriginal ?? '';
-        const dirty = target.value !== original;
-        if (dirty) {
-            card.setAttribute('data-dirty', 'true');
-        } else {
-            card.removeAttribute('data-dirty');
+
+        // Content textarea path.
+        if (target instanceof HTMLTextAreaElement && target.dataset.lbxUid) {
+            const card = target.closest('.lbx-diff-card');
+            if (!card) return;
+            const original = target.dataset.lbxOriginal ?? '';
+            const dirty = target.value !== original;
+            setFieldDirty(card, 'content', dirty);
+            updateCardDirtyAttr(card);
+            updateDirtyBadge(rootEl);
+            return;
         }
-        updateDirtyBadge(rootEl);
+
+        // Keys input path.
+        if (target instanceof HTMLInputElement && target.dataset.lbxKeysUid) {
+            const card = target.closest('.lbx-diff-card');
+            if (!card) return;
+            const original = parseEditableKeysString(target.dataset.lbxKeysOriginal ?? '');
+            const current = parseEditableKeysString(target.value);
+            const dirty = !arrShallowEq(original, current);
+            setFieldDirty(card, 'keys', dirty);
+            updateCardDirtyAttr(card);
+            updateDirtyBadge(rootEl);
+            return;
+        }
     });
+}
+
+/**
+ * Track per-field dirtiness on the card via two independent dataset flags
+ * so editing one input doesn't accidentally clear another's dirty marker.
+ */
+function setFieldDirty(card, field, dirty) {
+    const attr = field === 'keys' ? 'data-dirty-keys' : 'data-dirty-content';
+    if (dirty) card.setAttribute(attr, 'true');
+    else card.removeAttribute(attr);
+}
+
+/**
+ * Aggregate the per-field flags into the existing data-dirty attribute so
+ * downstream queries (badge counter, save sweep, discard prompt) keep using
+ * a single uniform selector.
+ */
+function updateCardDirtyAttr(card) {
+    const dirty = card.hasAttribute('data-dirty-keys') || card.hasAttribute('data-dirty-content');
+    if (dirty) card.setAttribute('data-dirty', 'true');
+    else card.removeAttribute('data-dirty');
 }
 
 /** Update the "N edits pending" badge in the dialog header. */
@@ -1074,8 +1230,12 @@ function updateDirtyBadge(rootEl) {
 }
 
 /**
- * Apply every dirty textarea's value back into the sibling data object's
- * matching entry.content. Returns a summary suitable for status reporting.
+ * Apply every dirty field's value back into the sibling data object's
+ * matching entry. Returns a summary suitable for status reporting.
+ *
+ * Both `content` (textarea) and `key` (comma-separated input) are written
+ * back. Each is independently dirty-tracked, so a card can save just one of
+ * them without touching the other.
  *
  * @param {HTMLElement} rootEl - The popup content container.
  * @param {{entries?: Record<string, any>}} siblingData
@@ -1097,26 +1257,53 @@ function applyEditsToSibling(rootEl, siblingData) {
         uidToKey.set(String(uid), storageKey);
     }
 
-    const dirtyAreas = rootEl.querySelectorAll('.lbx-diff-card[data-dirty="true"] textarea[data-lbx-uid]');
-    for (const node of dirtyAreas) {
-        const ta = /** @type {HTMLTextAreaElement} */ (node);
-        const uid = ta.dataset.lbxUid ?? '';
-        const newContent = ta.value;
+    /**
+     * Resolve a uid back to the actual entry object (nullable). Pushes to
+     * result.missing on lookup failure and returns null.
+     */
+    const resolveEntry = (uid) => {
         const storageKey = uidToKey.get(uid);
         if (storageKey === undefined) {
             result.missing.push(uid);
-            continue;
+            return null;
         }
         const entry = siblingData.entries[storageKey];
         if (!entry || typeof entry !== 'object') {
             result.missing.push(uid);
-            continue;
+            return null;
         }
+        return entry;
+    };
+
+    // ---- Content edits ----
+    const dirtyContent = rootEl.querySelectorAll('.lbx-diff-card[data-dirty-content="true"] textarea[data-lbx-uid]');
+    for (const node of dirtyContent) {
+        const ta = /** @type {HTMLTextAreaElement} */ (node);
+        const uid = ta.dataset.lbxUid ?? '';
+        const entry = resolveEntry(uid);
+        if (!entry) continue;
+        const newContent = ta.value;
         if (entry.content !== newContent) {
             entry.content = newContent;
             result.changed++;
         }
     }
+
+    // ---- Keys edits ----
+    const dirtyKeys = rootEl.querySelectorAll('.lbx-diff-card[data-dirty-keys="true"] input[data-lbx-keys-uid]');
+    for (const node of dirtyKeys) {
+        const inp = /** @type {HTMLInputElement} */ (node);
+        const uid = inp.dataset.lbxKeysUid ?? '';
+        const entry = resolveEntry(uid);
+        if (!entry) continue;
+        const newKeys = parseEditableKeysString(inp.value);
+        const oldKeys = Array.isArray(entry.key) ? entry.key : [];
+        if (!arrShallowEq(oldKeys, newKeys)) {
+            entry.key = newKeys;
+            result.changed++;
+        }
+    }
+
     return result;
 }
 
@@ -1200,9 +1387,9 @@ async function onViewDiffClicked(event) {
             console.warn(`[${MODULE_NAME}] updateWorldInfoList failed (continuing):`, e);
         }
 
-        const candidates = findSiblingCandidates(originalName, settings.dateFormat);
+        const candidates = await findSiblingCandidates(originalName, settings.dateFormat);
         if (candidates.length === 0) {
-            const allNames = (ctx.getWorldInfoNames?.() ?? []);
+            const allNames = await getWorldInfoNamesCompat(ctx);
             const sample = allNames.slice(0, 20).map(n => `  • ${n}`).join('\n');
             const more = allNames.length > 20 ? `\n  …and ${allNames.length - 20} more` : '';
             console.warn(`[${MODULE_NAME}] No siblings found for "${originalName}". Existing books:\n${sample}${more}`);

@@ -167,12 +167,38 @@
     display: none;
 }
 
+.lbx-diff-card.lbx-editing .lbx-diff-keys {
+    /* The editable keys input replaces this read-only summary while in edit
+       mode, so collapse it to avoid showing the same data twice. */
+    display: none;
+}
+
 .lbx-diff-card:not(.lbx-editing) .lbx-edit-area {
     display: none;
 }
 
 .lbx-edit-area {
     margin-top: 6px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.lbx-edit-area .lbx-edit-label {
+    font-size: 0.8em;
+    opacity: 0.75;
+    margin-top: 2px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+
+.lbx-edit-area .lbx-edit-keys {
+    width: 100%;
+    box-sizing: border-box;
+    font-family: var(--monoFontFamily, monospace);
+    font-size: 0.9em;
+    padding: 5px 6px;
+    border-radius: 3px;
 }
 
 .lbx-edit-area textarea {

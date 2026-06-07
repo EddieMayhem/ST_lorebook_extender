@@ -83,11 +83,16 @@ If at least one strict match exists, the newest one is used silently. If only lo
 
 ### Editing the sibling
 
-Each *Added* and *Modified* entry card in the diff dialog has an **Edit** toggle in the top-right (it flips to **Done** while editing). Clicking it swaps the diff view for a textarea pre-filled with the sibling's current `content` text. Edit freely; cards with unsaved changes get a yellow stripe and an `(unsaved)` tag next to the toggle, and the header shows the count of pending edits.
+Each *Added* and *Modified* entry card in the diff dialog has an **Edit** toggle in the top-right (it flips to **Done** while editing). Clicking it swaps the diff view for two inputs pre-filled with the sibling's current data:
+
+- **Keys** — a comma-separated list of trigger keywords (the entry's `key` array). Whitespace around each token is trimmed, empties are dropped, and duplicates are collapsed (first one wins) on save.
+- **Content** — the entry's `content` text.
+
+Cards with unsaved changes get a yellow stripe and an `(unsaved)` tag next to the toggle, and the header shows the count of pending edits.
 
 Click **Save changes** (in the dialog footer) to overwrite the sibling lorebook in place. The linked (base) lorebook and the character card link are never touched. Closing the dialog with unsaved edits prompts to discard.
 
-Only the `content` text is editable. Other fields (title, keys, order, etc.) stay as the LLM produced them — edit those via SillyTavern's standard world-info editor if needed. *Removed* cards remain read-only since those entries don't exist in the sibling.
+Only `key` and `content` are editable here. Other fields (title, secondary keys, order, position, etc.) stay as the LLM produced them — edit those via SillyTavern's standard world-info editor if needed. *Removed* cards remain read-only since those entries don't exist in the sibling.
 
 ## Requirements
 
