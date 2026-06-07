@@ -516,6 +516,49 @@ function parseStampSuffix(suffix, fmt) {
 }
 
 /**
+ * Strip our own " - <timestamp>" suffix (with optional "-N" collision counter)
+ * off a lorebook name, recursively, to recover the true base/root name.
+ *
+ * The bug this exists to fix: when a character card's `extensions.world` is
+ * relinked to a previously-generated sibling (e.g. "MyChar - 2026-06-07 14-30-00"),
+ * naively appending another timestamp produces stacked names like
+ * "MyChar - 2026-06-07 14-30-00 - 2026-06-08 09-15-00" and breaks sibling
+ * discovery / pruning because the prefix no longer matches the actual base.
+ *
+ * Algorithm: repeatedly take the substring after the *last* " - "; if it
+ * parses as our timestamp format (with or without a trailing "-N" counter),
+ * strip it and continue. Stop as soon as the suffix doesn't look like a
+ * timestamp — this is what protects names that legitimately contain " - ".
+ *
+ * The loop has a hard cap (16) purely as a defensive guard against pathological
+ * inputs; real-world stacks from this bug are at most a handful deep.
+ *
+ * @param {string} name
+ * @param {string} dateFormat
+ * @returns {string}
+ */
+function resolveBaseLorebookName(name, dateFormat) {
+    if (typeof name !== 'string' || !name.length) return name;
+    let current = name;
+    for (let guard = 0; guard < 16; guard++) {
+        const idx = current.lastIndexOf(' - ');
+        if (idx === -1) break;
+        const suffix = current.slice(idx + 3);
+        if (!suffix.length) break;
+        let ts = parseStampSuffix(suffix, dateFormat);
+        if (ts === null) {
+            // Tolerate a trailing collision counter like "-2" appended by the
+            // free-name picker when a "<base> - <stamp>" name was already taken.
+            const stripped = suffix.replace(/-\d+$/, '');
+            if (stripped !== suffix) ts = parseStampSuffix(stripped, dateFormat);
+        }
+        if (ts === null) break;
+        current = current.slice(0, idx);
+    }
+    return current;
+}
+
+/**
  * Resolve the connection profile id to use for generation.
  * Returns the configured one, or the current active profile, or null.
  */
@@ -570,6 +613,15 @@ async function runExtendPipeline() {
     if (!originalName || typeof originalName !== 'string') {
         throw new Error('Active character has no primary lorebook linked');
     }
+
+    // The character card may currently be linked to a previously-generated
+    // sibling (e.g. "MyChar - 2026-06-07 14-30-00"). For the LLM context we
+    // load whatever the card actually points at (so the user sees the same
+    // content they were editing), but for naming the *new* sibling and for
+    // running cleanup we always resolve back to the true base name. Without
+    // this, names would stack — "MyChar - <ts1> - <ts2> - <ts3>" — and
+    // sibling discovery / maxVersions pruning would silently break.
+    const baseName = resolveBaseLorebookName(originalName, settings.dateFormat);
 
     const originalData = await ctx.loadWorldInfo(originalName);
     if (!originalData) {
@@ -679,7 +731,11 @@ async function runExtendPipeline() {
     }
 
     // 6. Pick a free name.
-    let newName = `${originalName} - ${formatStamp(settings.dateFormat)}`;
+    // Always derive the new name from the resolved base, never from the
+    // currently-linked name. This is the fix for the timestamp-stacking bug:
+    // if the card is linked to "MyChar - <ts1>", we still produce
+    // "MyChar - <ts2>", not "MyChar - <ts1> - <ts2>".
+    let newName = `${baseName} - ${formatStamp(settings.dateFormat)}`;
     // Fetch the lorebook list once and reuse for both name collision and the
     // cleanup pass below. Avoids a duplicate REST round-trip on older ST builds
     // where ctx.getWorldInfoNames doesn't exist (added 2026-04-23, PR #5505).
@@ -703,14 +759,17 @@ async function runExtendPipeline() {
     await ctx.saveWorldInfo(newName, normalized, true);
     await ctx.updateWorldInfoList?.();
 
-    // 8. Cleanup. Find siblings = anything with the exact "<original> - " prefix
+    // 8. Cleanup. Find siblings = anything with the exact "<base> - " prefix
     // whose remainder parses as our timestamp format.
     // Re-fetch the list so the just-created lorebook is included (and any
     // concurrent edits since step 6 are reflected). Case-insensitive matching
     // mirrors findSiblingCandidates so cleanup works even if the character
     // card's `extensions.world` value drifts in case from the on-disk file_id.
+    // We use the resolved base name here, not the (possibly already-timestamped)
+    // linked name, otherwise cleanup looks for siblings of a sibling and
+    // silently prunes nothing.
     knownNames = await getWorldInfoNamesCompat(ctx);
-    const origLowerCleanup = String(originalName).toLowerCase();
+    const origLowerCleanup = String(baseName).toLowerCase();
     const prefixLower = `${origLowerCleanup} - `;
     const newNameLower = newName.toLowerCase();
     const limit = Math.max(1, Number(settings.maxVersions) || 5);
@@ -752,7 +811,10 @@ async function runExtendPipeline() {
         lastProcessedIndex: lastIndex,
         lastProcessedAt: Date.now(),
         lastProcessedHash: simpleHash(lastMes),
-        sourceLorebook: originalName,
+        // Always store the resolved base so this value stays stable across
+        // runs even after the character card gets relinked to a timestamped
+        // sibling. Avoids confusing "sourceLorebook" drift in saved metadata.
+        sourceLorebook: baseName,
     };
     await ctx.saveMetadata();
 
@@ -1463,23 +1525,31 @@ async function onViewDiffClicked(event) {
         if (!character) {
             throw new Error('Active character could not be resolved');
         }
-        const originalName = character?.data?.extensions?.world;
-        if (!originalName || typeof originalName !== 'string') {
+        const linkedName = character?.data?.extensions?.world;
+        if (!linkedName || typeof linkedName !== 'string') {
             throw new Error('Active character has no primary lorebook linked');
         }
+
+        // The card may currently point at a previously-generated sibling
+        // (e.g. "MyChar - 2026-06-07 14-30-00"). Sibling discovery has to
+        // happen against the true base, otherwise we'd be searching for
+        // siblings of a sibling and miss the whole family. The "Base (linked)"
+        // header in the diff dialog still shows linkedName — that's what's
+        // actually loaded and edited on the left side.
+        const baseName = resolveBaseLorebookName(linkedName, settings.dateFormat);
 
         // Refresh the world info list from the server so stale caches can't hide a sibling.
         try { await ctx.updateWorldInfoList?.(); } catch (e) {
             console.warn(`[${MODULE_NAME}] updateWorldInfoList failed (continuing):`, e);
         }
 
-        const candidates = await findSiblingCandidates(originalName, settings.dateFormat);
+        const candidates = await findSiblingCandidates(baseName, settings.dateFormat);
         if (candidates.length === 0) {
             const allNames = await getWorldInfoNamesCompat(ctx);
             // Rank existing books by how plausibly they could be siblings, so
             // the user can immediately see whether there's a typo / case
             // mismatch / wrong "base lorebook" link on the character card.
-            const ranked = rankProbableSiblings(originalName, allNames);
+            const ranked = rankProbableSiblings(baseName, allNames);
             const topMatches = ranked.slice(0, 5);
             const tail = allNames
                 .filter(n => !topMatches.some(t => t.name === n))
@@ -1490,12 +1560,16 @@ async function onViewDiffClicked(event) {
                 : '  (none)';
             const tailLine = tail.length ? `\nOther lorebooks (${allNames.length} total):\n` + tail.map(n => `  • ${n}`).join('\n') : '';
 
+            const linkedNote = baseName !== linkedName
+                ? `Card is linked to: "${linkedName}"\n(resolved base: "${baseName}")\n\n`
+                : `Card is linked to: "${linkedName}"\n\n`;
+
             console.warn(
                 `[${MODULE_NAME}] No siblings found.\n` +
-                `Looking for sibling of: "${originalName}"\n` +
-                `(this is what the character card has linked as its primary lorebook)\n\n` +
+                linkedNote +
+                `Looking for siblings of base: "${baseName}"\n\n` +
                 `Closest matches:\n${matchesLine}${tailLine}\n\n` +
-                `A "sibling" must be a lorebook whose name starts with "${originalName}". ` +
+                `A "sibling" must be a lorebook whose name starts with "${baseName}". ` +
                 `If your sibling has a different name, either rename it or change the ` +
                 `character card's linked lorebook to the matching base.`,
             );
@@ -1506,7 +1580,7 @@ async function onViewDiffClicked(event) {
                 ? `\nClosest existing: "${topMatches[0].name}"`
                 : '';
             toastr.info(
-                `No sibling of "${originalName}" found among ${allNames.length} lorebook${allNames.length === 1 ? '' : 's'}.${hint}\nSee browser console for details.`,
+                `No sibling of "${baseName}" found among ${allNames.length} lorebook${allNames.length === 1 ? '' : 's'}.${hint}\nSee browser console for details.`,
                 'Lorebook Extender',
                 { timeOut: 10000 },
             );
@@ -1526,21 +1600,21 @@ async function onViewDiffClicked(event) {
             chosen = candidates[0];
         } else {
             // Multiple loose/fuzzy candidates; let the user pick.
-            const picked = await promptSiblingChoice(candidates, originalName);
+            const picked = await promptSiblingChoice(candidates, baseName);
             if (!picked) return; // cancelled
             chosen = picked;
         }
 
         const [oldData, newData] = await Promise.all([
-            ctx.loadWorldInfo(originalName),
+            ctx.loadWorldInfo(linkedName),
             ctx.loadWorldInfo(chosen.name),
         ]);
-        if (!oldData) throw new Error(`Could not load lorebook "${originalName}"`);
+        if (!oldData) throw new Error(`Could not load lorebook "${linkedName}"`);
         if (!newData) throw new Error(`Could not load lorebook "${chosen.name}"`);
 
         const diff = diffLorebooks(oldData, newData);
         const html = buildDiffHtml({
-            originalName,
+            originalName: linkedName,
             latestName: chosen.name,
             diff,
             editable: true,
