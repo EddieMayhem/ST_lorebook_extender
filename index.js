@@ -161,6 +161,7 @@ const DEFAULT_SETTINGS = Object.freeze({
     userPromptTemplate: DEFAULT_USER_PROMPT,
     maxTokens: 4096,
     maxVersions: 5,
+    maxMessages: 0, // 0 = no limit; otherwise cap visible messages sent to the LLM (newest kept)
     dateFormat: 'YYYY-MM-DD HH-mm-ss',
     includeFullChat: true,
 });
@@ -282,37 +283,59 @@ function simpleHash(str) {
 }
 
 /**
- * Render visible chat messages into a plain-text transcript.
+ * Mirror of the transcript filter: is this message visible (i.e. would be
+ * sent to the LLM)? Kept as a single source of truth so the message-count
+ * log and renderChatTranscript can never drift apart.
  *
  * Filtering rules:
  *   - `is_system`     — ST internal system notes (welcome banners, /sys output).
  *   - `is_hidden`     — user explicitly /hide'd these so the model "forgets" them.
  *   - `extra.isHidden` — older builds + some extensions write the flag here instead.
- * Sending any of these would defeat the user's intent (system noise polluting
- * the diff, or hidden context leaking back into the next LLM call).
+ *   - empty body      — nothing useful to send.
+ *
+ * @param {any} msg
+ * @returns {boolean}
+ */
+function isVisibleMessage(msg) {
+    if (!msg) return false;
+    if (msg.is_system) return false;
+    if (msg.is_hidden) return false;
+    if (msg.extra && msg.extra.isHidden) return false;
+    return (msg.mes ?? '').toString().trim().length > 0;
+}
+
+/**
+ * Render visible chat messages into a plain-text transcript.
+ *
+ * Visibility is decided by isVisibleMessage(); sending hidden/system content
+ * would defeat the user's intent (system noise polluting the diff, or hidden
+ * context leaking back into the next LLM call).
  *
  * Swipes: each character message stores its active alternative in `msg.mes`,
  * and ST keeps `mes` in sync with `swipe_id` automatically. So reading `msg.mes`
  * is correct — no special-casing of `msg.swipes` needed.
  *
+ * When `maxMessages` > 0, only the newest N visible messages are kept (the
+ * transcript is truncated from the front). 0 means no limit.
+ *
  * @param {Array<any>} messages
+ * @param {number} [maxMessages]
  * @returns {string}
  */
-function renderChatTranscript(messages) {
+function renderChatTranscript(messages, maxMessages = 0) {
     const lines = [];
     for (const msg of messages) {
-        if (!msg) continue;
-        if (msg.is_system) continue;
-        if (msg.is_hidden) continue;
-        if (msg.extra && msg.extra.isHidden) continue;
+        if (!isVisibleMessage(msg)) continue;
         // `||` instead of `??` so an empty-string name still falls through to the
         // user/character default; `??` would let "" through and produce ": text".
         const name = (msg.name || (msg.is_user ? 'User' : 'Character')).toString().trim();
         const body = (msg.mes ?? '').toString().trim();
-        if (!body) continue;
         lines.push(`${name}: ${body}`);
     }
-    return lines.join('\n\n');
+    const limited = (Number.isFinite(maxMessages) && maxMessages > 0)
+        ? lines.slice(-maxMessages)
+        : lines;
+    return limited.join('\n\n');
 }
 
 /**
@@ -700,9 +723,34 @@ async function runExtendPipeline() {
         baselineDescription = `messages ${startIndex}..${totalLen - 1}`;
     }
 
-    const transcript = renderChatTranscript(diffMessages);
+    const maxMessages = Math.max(0, Number(settings.maxMessages) || 0);
+
+    // Build the visible-message list once so we can log exactly what is sent
+    // (sender + a short preview), independent of how renderChatTranscript joins.
+    // isVisibleMessage is the shared source of truth with the transcript builder.
+    const visible = diffMessages.filter(isVisibleMessage);
+    const totalVisible = visible.length;
+    const sent = (maxMessages > 0) ? visible.slice(-maxMessages) : visible;
+    const truncated = maxMessages > 0 && totalVisible > sent.length;
+
+    console.log(
+        `[${MODULE_NAME}] Sending ${sent.length} of ${totalVisible} visible message(s)`
+        + (truncated ? ` (capped at ${maxMessages}, newest kept)` : '')
+        + ` from ${baselineDescription}:`,
+        sent.map((m, i) => {
+            const name = (m.name || (m.is_user ? 'User' : 'Character')).toString().trim();
+            const body = (m.mes ?? '').toString().trim();
+            const preview = body.length > 80 ? body.slice(0, 80) + '…' : body;
+            return `#${i + 1} ${name}: ${preview}`;
+        }),
+    );
+
+    const transcript = renderChatTranscript(diffMessages, maxMessages);
     if (!transcript.trim()) {
         throw new Error('Diff contains no visible messages (all hidden/system)');
+    }
+    if (truncated) {
+        baselineDescription += ` (newest ${sent.length} of ${totalVisible} messages)`;
     }
 
     // 3. Build prompt.
@@ -1827,6 +1875,7 @@ function bindUi(root) {
     const userEl = /** @type {HTMLTextAreaElement} */ ($('#lbx_user_prompt'));
     const maxTokEl = /** @type {HTMLInputElement} */ ($('#lbx_max_tokens'));
     const maxVerEl = /** @type {HTMLInputElement} */ ($('#lbx_max_versions'));
+    const maxMsgEl = /** @type {HTMLInputElement} */ ($('#lbx_max_messages'));
     const includeEl = /** @type {HTMLInputElement} */ ($('#lbx_include_full'));
     const runBtn = $('#lbx_run');
     const resetBtn = $('#lbx_reset_snapshot');
@@ -1840,6 +1889,7 @@ function bindUi(root) {
     userEl.value = settings.userPromptTemplate;
     maxTokEl.value = String(settings.maxTokens);
     maxVerEl.value = String(settings.maxVersions);
+    maxMsgEl.value = String(settings.maxMessages);
     includeEl.checked = settings.includeFullChat;
 
     // Change handlers.
@@ -1856,6 +1906,13 @@ function bindUi(root) {
         const v = parseInt(maxVerEl.value, 10);
         settings.maxVersions = Number.isFinite(v) && v >= 1 ? v : DEFAULT_SETTINGS.maxVersions;
         maxVerEl.value = String(settings.maxVersions);
+        persistSettings();
+    });
+    maxMsgEl.addEventListener('change', () => {
+        const v = parseInt(maxMsgEl.value, 10);
+        // 0 is valid here (means "no limit"), so accept >= 0 rather than >= 1.
+        settings.maxMessages = Number.isFinite(v) && v >= 0 ? v : DEFAULT_SETTINGS.maxMessages;
+        maxMsgEl.value = String(settings.maxMessages);
         persistSettings();
     });
     includeEl.addEventListener('change', () => { settings.includeFullChat = includeEl.checked; persistSettings(); });

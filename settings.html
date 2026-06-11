@@ -56,6 +56,14 @@
                 </div>
             </div>
 
+            <label for="lbx_max_messages">
+                <span data-i18n="Max messages to send">Max messages to send</span>
+                <small class="lbx-hint" data-i18n="lbx_max_messages_hint">
+                    0 = no limit. Caps the newest visible chat messages sent to the LLM.
+                </small>
+            </label>
+            <input id="lbx_max_messages" type="number" class="text_pole" min="0" step="1" />
+
             <label class="checkbox_label" for="lbx_include_full">
                 <input id="lbx_include_full" type="checkbox" />
                 <span data-i18n="Include full chat on first run">

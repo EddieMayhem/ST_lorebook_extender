@@ -35,6 +35,7 @@ Open *Extensions* → **Lorebook Extender** drawer. Settings:
 | User prompt template | Sent as the `user` role. Supports `{{CHARACTER_NAME}}`, `{{ORIGINAL_LOREBOOK}}`, `{{DIFF}}`. |
 | Max output tokens | Cap on the LLM response length. |
 | Max versions to keep | How many timestamped siblings to keep before pruning. |
+| Max messages to send | Caps how many of the newest visible chat messages are sent to the LLM. `0` = no limit. When the diff exceeds the cap, only the most recent messages are sent (the snapshot still advances past the whole diff, so nothing is re-sent later). |
 | Include full chat on first run | If checked and no snapshot exists yet (first run on this chat), send the whole chat instead of failing. |
 
 Action buttons:
