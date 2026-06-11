@@ -41,6 +41,28 @@
             </label>
             <textarea id="lbx_user_prompt" class="text_pole textarea_compact" rows="10"></textarea>
 
+            <hr />
+
+            <p class="lbx-hint" data-i18n="lbx_generate_intro">
+                Used by the <b>Generate from card</b> button, which builds a brand-new lorebook
+                from the character card and chat — ignoring any linked lorebook and the snapshot.
+            </p>
+
+            <label for="lbx_generate_system_prompt">
+                <span data-i18n="Generate system prompt">Generate system prompt</span>
+            </label>
+            <textarea id="lbx_generate_system_prompt" class="text_pole textarea_compact" rows="5"></textarea>
+
+            <label for="lbx_generate_user_prompt">
+                <span data-i18n="Generate user prompt template">Generate user prompt template</span>
+                <small class="lbx-hint" data-i18n="lbx_generate_user_prompt_hint">
+                    Placeholders: <code>{{CHARACTER_NAME}}</code>, <code>{{CHARACTER_CARD}}</code>, <code>{{DIFF}}</code>.
+                </small>
+            </label>
+            <textarea id="lbx_generate_user_prompt" class="text_pole textarea_compact" rows="10"></textarea>
+
+            <hr />
+
             <div class="flex-container">
                 <div class="flex1">
                     <label for="lbx_max_tokens">
@@ -85,6 +107,10 @@
                 <div id="lbx_view_diff" class="menu_button menu_button_icon" title="Compare the latest extended lorebook against the character's currently linked lorebook">
                     <i class="fa-solid fa-code-compare"></i>
                     <span data-i18n="View latest diff">View latest diff</span>
+                </div>
+                <div id="lbx_generate" class="menu_button menu_button_icon" title="Generate a brand-new lorebook from the selected character card and chat (ignores any linked lorebook and the snapshot)">
+                    <i class="fa-solid fa-book-medical"></i>
+                    <span data-i18n="Generate from card">Generate from card</span>
                 </div>
             </div>
 

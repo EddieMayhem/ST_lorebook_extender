@@ -154,11 +154,38 @@ New chat content since the last update:
 
 Return the complete updated lorebook as JSON conforming to the provided schema.`;
 
+// Prompts for the "Generate from card" flow. Unlike the extend prompts, these
+// build a brand-new lorebook from scratch using the character card and chat —
+// no existing lorebook is provided, so there is no {{ORIGINAL_LOREBOOK}}
+// placeholder here. The card JSON is exposed as {{CHARACTER_CARD}}.
+const DEFAULT_GENERATE_SYSTEM_PROMPT = `You are a lorebook author for a roleplay.
+Given a character card and some chat content, create a brand-new lorebook in JSON from scratch.
+Add entries for the main character, other characters, places, items, factions, events, and any notable facts implied by the card or the chat.
+Each entry must have meaningful 'key' triggers, a clear 'comment' title, and concise factual 'content'.
+Do not invent contradictions; stay consistent with the character card and chat.
+Return the COMPLETE lorebook as JSON.`;
+
+const DEFAULT_GENERATE_USER_PROMPT = `Character: {{CHARACTER_NAME}}
+
+Character card (JSON):
+\`\`\`json
+{{CHARACTER_CARD}}
+\`\`\`
+
+Chat content:
+\`\`\`
+{{DIFF}}
+\`\`\`
+
+Create a complete new lorebook as JSON conforming to the provided schema.`;
+
 const DEFAULT_SETTINGS = Object.freeze({
     enabled: true,
     profileId: '',
     systemPrompt: DEFAULT_SYSTEM_PROMPT,
     userPromptTemplate: DEFAULT_USER_PROMPT,
+    generateSystemPrompt: DEFAULT_GENERATE_SYSTEM_PROMPT,
+    generateUserPromptTemplate: DEFAULT_GENERATE_USER_PROMPT,
     maxTokens: 4096,
     maxVersions: 5,
     maxMessages: 0, // 0 = no limit; otherwise cap visible messages sent to the LLM (newest kept)
@@ -598,6 +625,77 @@ function resolveBaseLorebookName(name, dateFormat) {
 }
 
 /**
+ * Build a sanitized JSON payload of the character card for the "generate"
+ * flow. SillyTavern character objects carry a lot of weight that is useless
+ * (and expensive in tokens) to an LLM authoring a lorebook: the avatar
+ * filename/base64 image, chat-history bookkeeping, talkativeness/fav counters,
+ * creation timestamps, and — importantly — the linked-world reference (which we
+ * deliberately ignore in generate mode). Rather than blocklisting an
+ * ever-growing set of noisy fields, we allow-list the known narrative fields,
+ * preferring the nested V2 `data` values when present and falling back to the
+ * legacy top-level ones.
+ *
+ * @param {any} character
+ * @returns {string} pretty-printed JSON
+ */
+function buildCharacterCardPayload(character) {
+    const card = (character && typeof character === 'object') ? character : {};
+    const data = (card.data && typeof card.data === 'object') ? card.data : {};
+
+    // For each logical field, prefer the V2 `data.<field>`, then the legacy
+    // top-level `<field>`. pick() returns undefined when neither is present so
+    // empty fields are dropped from the payload rather than serialized as null.
+    const pick = (field) => {
+        const v = data[field] !== undefined ? data[field] : card[field];
+        return v;
+    };
+
+    const out = {};
+    const assign = (outKey, value) => {
+        if (value === undefined || value === null) return;
+        if (typeof value === 'string' && !value.trim()) return;
+        if (Array.isArray(value) && value.length === 0) return;
+        out[outKey] = value;
+    };
+
+    assign('name', pick('name'));
+    assign('description', pick('description'));
+    assign('personality', pick('personality'));
+    assign('scenario', pick('scenario'));
+    assign('first_mes', pick('first_mes'));
+    assign('mes_example', pick('mes_example'));
+    assign('system_prompt', pick('system_prompt'));
+    assign('post_history_instructions', pick('post_history_instructions'));
+    assign('creator_notes', pick('creator_notes'));
+    assign('tags', pick('tags'));
+    assign('alternate_greetings', pick('alternate_greetings'));
+
+    // Character book embedded on the card is lore the author already wrote;
+    // surface its entries (without ballast) so generation can build on them.
+    const charBook = data.character_book;
+    if (charBook && typeof charBook === 'object' && Array.isArray(charBook.entries)) {
+        const entries = charBook.entries
+            .filter(e => e && typeof e === 'object')
+            .map(e => ({
+                keys: e.keys ?? e.key,
+                content: e.content,
+                comment: e.comment ?? e.name,
+            }))
+            .filter(e => (e.content && String(e.content).trim()) || (Array.isArray(e.keys) && e.keys.length));
+        if (entries.length) out.character_book = { entries };
+    }
+
+    try {
+        return JSON.stringify(out, null, 2);
+    } catch (e) {
+        // Defensive: a circular ref shouldn't be possible after the allow-list
+        // above, but never let serialization crash the whole pipeline.
+        console.warn(`[${MODULE_NAME}] Failed to stringify character card payload:`, e);
+        return JSON.stringify({ name: out.name ?? 'Unknown' }, null, 2);
+    }
+}
+
+/**
  * Resolve the connection profile id to use for generation.
  * Returns the configured one, or the current active profile, or null.
  */
@@ -622,9 +720,31 @@ function isConnectionManagerAvailable() {
 // ------------------------------------------------------------------ pipeline -
 
 /**
- * The full extend-lorebook flow. Returns a string status on success or throws on failure.
+ * Thin wrapper preserving the original entry point: extend the character's
+ * currently linked lorebook.
+ * Returns a string status on success or throws on failure.
  */
 async function runExtendPipeline() {
+    return runPipeline({ mode: 'extend' });
+}
+
+/**
+ * The full lorebook flow, shared by both the "extend" and "generate" buttons.
+ *
+ * - mode 'extend' (default): take the character's linked lorebook, diff the
+ *   chat against the per-chat snapshot, and ask the LLM for an updated book.
+ * - mode 'generate': ignore any linked lorebook AND the snapshot; send the
+ *   character card JSON + the (capped) chat and ask the LLM for a brand-new
+ *   book. The new file is named from the character's name.
+ *
+ * Everything after prompt construction (parse → normalize → name → create →
+ * save → prune) is identical for both modes. Returns a status string on
+ * success or throws on failure.
+ *
+ * @param {{ mode?: 'extend' | 'generate' }} [options]
+ */
+async function runPipeline({ mode = 'extend' } = {}) {
+    const isGenerate = mode === 'generate';
     const ctx = SillyTavern.getContext();
     const settings = getSettings();
 
@@ -640,7 +760,7 @@ async function runExtendPipeline() {
         throw new Error('No character is currently selected');
     }
     if (!Array.isArray(ctx.chat) || ctx.chat.length === 0) {
-        throw new Error('Chat is empty; nothing to extend from');
+        throw new Error(isGenerate ? 'Chat is empty; nothing to generate from' : 'Chat is empty; nothing to extend from');
     }
 
     const character = ctx.characters[ctx.characterId];
@@ -648,79 +768,102 @@ async function runExtendPipeline() {
         throw new Error('Active character could not be resolved');
     }
 
-    const originalName = character?.data?.extensions?.world;
-    if (!originalName || typeof originalName !== 'string') {
-        throw new Error('Active character has no primary lorebook linked');
-    }
+    // In generate mode there may be no linked lorebook at all — that's the
+    // whole point — so we skip both the requirement and the load. The new
+    // book's base name comes from the character's name instead of the linked
+    // lorebook, but it still flows through the same naming/collision/pruning
+    // logic below, forming its own timestamped family.
+    let originalData = null;
+    let baseName;
+    if (isGenerate) {
+        const charName = (character.name ?? '').toString().trim();
+        baseName = charName || 'Lorebook';
+    } else {
+        const originalName = character?.data?.extensions?.world;
+        if (!originalName || typeof originalName !== 'string') {
+            throw new Error('Active character has no primary lorebook linked');
+        }
 
-    // The character card may currently be linked to a previously-generated
-    // sibling (e.g. "MyChar - 2026-06-07 14-30-00"). For the LLM context we
-    // load whatever the card actually points at (so the user sees the same
-    // content they were editing), but for naming the *new* sibling and for
-    // running cleanup we always resolve back to the true base name. Without
-    // this, names would stack — "MyChar - <ts1> - <ts2> - <ts3>" — and
-    // sibling discovery / maxVersions pruning would silently break.
-    const baseName = resolveBaseLorebookName(originalName, settings.dateFormat);
+        // The character card may currently be linked to a previously-generated
+        // sibling (e.g. "MyChar - 2026-06-07 14-30-00"). For the LLM context we
+        // load whatever the card actually points at (so the user sees the same
+        // content they were editing), but for naming the *new* sibling and for
+        // running cleanup we always resolve back to the true base name. Without
+        // this, names would stack — "MyChar - <ts1> - <ts2> - <ts3>" — and
+        // sibling discovery / maxVersions pruning would silently break.
+        baseName = resolveBaseLorebookName(originalName, settings.dateFormat);
 
-    const originalData = await ctx.loadWorldInfo(originalName);
-    if (!originalData) {
-        throw new Error(`Could not load lorebook "${originalName}"`);
-    }
-
-    // 2. Build diff.
-    let snapshot = ctx.chatMetadata?.[SNAPSHOT_KEY] || null;
-    const totalLen = ctx.chat.length;
-
-    // Validate the snapshot against the current chat. If the chat is shorter
-    // than the snapshot expects, or the recorded chat-length doesn't match
-    // any plausible state (deletions, /del, branch switch, partial swipe
-    // rollback), treat the snapshot as invalidated and fall through to the
-    // "no snapshot" branch — otherwise startIndex math points into thin air
-    // and we'd silently feed the LLM the wrong slice (or, worse, an empty
-    // diff that we then snapshot-advance off of).
-    if (snapshot) {
-        const lastIdx = Number(snapshot.lastProcessedIndex);
-        const recordedLen = Number(snapshot.chatLength);
-        const isStale =
-            !Number.isFinite(lastIdx)
-            || lastIdx < 0
-            || lastIdx >= totalLen
-            || (Number.isFinite(recordedLen) && recordedLen > totalLen);
-        if (isStale) {
-            console.warn(
-                `[${MODULE_NAME}] Snapshot invalidated: lastProcessedIndex=${snapshot.lastProcessedIndex}, `
-                + `recorded chatLength=${snapshot.chatLength}, actual chat length=${totalLen}. `
-                + `Treating this run as if no snapshot existed.`,
-            );
-            snapshot = null;
+        originalData = await ctx.loadWorldInfo(originalName);
+        if (!originalData) {
+            throw new Error(`Could not load lorebook "${originalName}"`);
         }
     }
+
+    // 2. Select messages to send.
+    const totalLen = ctx.chat.length;
 
     /** @type {Array<any>} */
     let diffMessages;
     let baselineDescription;
 
-    if (!snapshot) {
-        if (settings.includeFullChat) {
-            diffMessages = ctx.chat.slice();
-            baselineDescription = 'full chat (first run)';
-        } else {
-            throw new Error('No prior snapshot for this chat. Enable "Include full chat on first run" or click Reset snapshot first.');
-        }
+    if (isGenerate) {
+        // Generate mode is snapshot-agnostic: it neither reads nor advances the
+        // per-chat snapshot (so a later Extend still works exactly as before).
+        // It simply sends the whole chat, capped by maxMessages (newest kept)
+        // further down — the same cap the extend flow uses.
+        diffMessages = ctx.chat.slice();
+        baselineDescription = 'character card + chat';
     } else {
-        let startIndex = (snapshot.lastProcessedIndex ?? -1) + 1;
+        // 2a. Build diff against the per-chat snapshot.
+        let snapshot = ctx.chatMetadata?.[SNAPSHOT_KEY] || null;
 
-        // If the message at the snapshot index was edited, replay from it.
-        const ref = ctx.chat[snapshot.lastProcessedIndex];
-        if (ref && snapshot.lastProcessedHash && simpleHash((ref.mes ?? '').toString()) !== snapshot.lastProcessedHash) {
-            startIndex = Math.max(0, snapshot.lastProcessedIndex);
+        // Validate the snapshot against the current chat. If the chat is shorter
+        // than the snapshot expects, or the recorded chat-length doesn't match
+        // any plausible state (deletions, /del, branch switch, partial swipe
+        // rollback), treat the snapshot as invalidated and fall through to the
+        // "no snapshot" branch — otherwise startIndex math points into thin air
+        // and we'd silently feed the LLM the wrong slice (or, worse, an empty
+        // diff that we then snapshot-advance off of).
+        if (snapshot) {
+            const lastIdx = Number(snapshot.lastProcessedIndex);
+            const recordedLen = Number(snapshot.chatLength);
+            const isStale =
+                !Number.isFinite(lastIdx)
+                || lastIdx < 0
+                || lastIdx >= totalLen
+                || (Number.isFinite(recordedLen) && recordedLen > totalLen);
+            if (isStale) {
+                console.warn(
+                    `[${MODULE_NAME}] Snapshot invalidated: lastProcessedIndex=${snapshot.lastProcessedIndex}, `
+                    + `recorded chatLength=${snapshot.chatLength}, actual chat length=${totalLen}. `
+                    + `Treating this run as if no snapshot existed.`,
+                );
+                snapshot = null;
+            }
         }
 
-        if (startIndex >= totalLen) {
-            throw new Error('No new messages since the last run. Send/receive new messages first.');
+        if (!snapshot) {
+            if (settings.includeFullChat) {
+                diffMessages = ctx.chat.slice();
+                baselineDescription = 'full chat (first run)';
+            } else {
+                throw new Error('No prior snapshot for this chat. Enable "Include full chat on first run" or click Reset snapshot first.');
+            }
+        } else {
+            let startIndex = (snapshot.lastProcessedIndex ?? -1) + 1;
+
+            // If the message at the snapshot index was edited, replay from it.
+            const ref = ctx.chat[snapshot.lastProcessedIndex];
+            if (ref && snapshot.lastProcessedHash && simpleHash((ref.mes ?? '').toString()) !== snapshot.lastProcessedHash) {
+                startIndex = Math.max(0, snapshot.lastProcessedIndex);
+            }
+
+            if (startIndex >= totalLen) {
+                throw new Error('No new messages since the last run. Send/receive new messages first.');
+            }
+            diffMessages = ctx.chat.slice(startIndex);
+            baselineDescription = `messages ${startIndex}..${totalLen - 1}`;
         }
-        diffMessages = ctx.chat.slice(startIndex);
-        baselineDescription = `messages ${startIndex}..${totalLen - 1}`;
     }
 
     const maxMessages = Math.max(0, Number(settings.maxMessages) || 0);
@@ -747,20 +890,33 @@ async function runExtendPipeline() {
 
     const transcript = renderChatTranscript(diffMessages, maxMessages);
     if (!transcript.trim()) {
-        throw new Error('Diff contains no visible messages (all hidden/system)');
+        throw new Error(isGenerate
+            ? 'Chat contains no visible messages (all hidden/system)'
+            : 'Diff contains no visible messages (all hidden/system)');
     }
     if (truncated) {
         baselineDescription += ` (newest ${sent.length} of ${totalVisible} messages)`;
     }
 
-    // 3. Build prompt.
-    const userPrompt = settings.userPromptTemplate
-        .replaceAll('{{CHARACTER_NAME}}', character.name ?? 'Unknown')
-        .replaceAll('{{ORIGINAL_LOREBOOK}}', JSON.stringify(originalData, null, 2))
-        .replaceAll('{{DIFF}}', transcript);
+    // 3. Build prompt. Generate mode swaps the templates and exposes the
+    // sanitized character card JSON via {{CHARACTER_CARD}} (there is no
+    // existing lorebook to substitute for {{ORIGINAL_LOREBOOK}}).
+    const systemPrompt = isGenerate ? settings.generateSystemPrompt : settings.systemPrompt;
+    let userPrompt;
+    if (isGenerate) {
+        userPrompt = settings.generateUserPromptTemplate
+            .replaceAll('{{CHARACTER_NAME}}', character.name ?? 'Unknown')
+            .replaceAll('{{CHARACTER_CARD}}', buildCharacterCardPayload(character))
+            .replaceAll('{{DIFF}}', transcript);
+    } else {
+        userPrompt = settings.userPromptTemplate
+            .replaceAll('{{CHARACTER_NAME}}', character.name ?? 'Unknown')
+            .replaceAll('{{ORIGINAL_LOREBOOK}}', JSON.stringify(originalData, null, 2))
+            .replaceAll('{{DIFF}}', transcript);
+    }
 
     // 4. Show loader and generate.
-    const loaderHandle = ctx.loader?.show?.({ message: 'Extending lorebook…' });
+    const loaderHandle = ctx.loader?.show?.({ message: isGenerate ? 'Generating lorebook…' : 'Extending lorebook…' });
     let rawText;
     try {
         if (isConnectionManagerAvailable()) {
@@ -770,7 +926,7 @@ async function runExtendPipeline() {
             }
             const CMRS = ctx.ConnectionManagerRequestService;
             const messages = [
-                { role: 'system', content: settings.systemPrompt },
+                { role: 'system', content: systemPrompt },
                 { role: 'user', content: userPrompt },
             ];
             const result = await CMRS.sendRequest(profileId, messages, settings.maxTokens, {
@@ -783,7 +939,7 @@ async function runExtendPipeline() {
         } else {
             // Fallback: use whatever the user currently has active.
             rawText = await ctx.generateRaw({
-                systemPrompt: settings.systemPrompt,
+                systemPrompt: systemPrompt,
                 prompt: userPrompt,
                 jsonSchema: LOREBOOK_SCHEMA,
             });
@@ -903,24 +1059,28 @@ async function runExtendPipeline() {
         console.warn(`[${MODULE_NAME}] Sibling cleanup failed (continuing; snapshot will still advance):`, e);
     }
 
-    // 9. Update snapshot for this chat.
-    const lastIndex = totalLen - 1;
-    const lastMes = (ctx.chat[lastIndex]?.mes ?? '').toString();
-    ctx.chatMetadata[SNAPSHOT_KEY] = {
-        lastProcessedIndex: lastIndex,
-        lastProcessedAt: Date.now(),
-        lastProcessedHash: simpleHash(lastMes),
-        // Recorded chat length lets the next run detect deletions/truncation
-        // (e.g. /del, branch switch) — if the chat later shrinks below this
-        // value, the snapshot is treated as invalidated rather than blindly
-        // sliced from a stale index.
-        chatLength: totalLen,
-        // Always store the resolved base so this value stays stable across
-        // runs even after the character card gets relinked to a timestamped
-        // sibling. Avoids confusing "sourceLorebook" drift in saved metadata.
-        sourceLorebook: baseName,
-    };
-    await ctx.saveMetadata();
+    // 9. Update snapshot for this chat. Generate mode is snapshot-agnostic and
+    // must not touch it — otherwise it would silently advance the extend
+    // baseline and a subsequent "Extend" would skip messages it never processed.
+    if (!isGenerate) {
+        const lastIndex = totalLen - 1;
+        const lastMes = (ctx.chat[lastIndex]?.mes ?? '').toString();
+        ctx.chatMetadata[SNAPSHOT_KEY] = {
+            lastProcessedIndex: lastIndex,
+            lastProcessedAt: Date.now(),
+            lastProcessedHash: simpleHash(lastMes),
+            // Recorded chat length lets the next run detect deletions/truncation
+            // (e.g. /del, branch switch) — if the chat later shrinks below this
+            // value, the snapshot is treated as invalidated rather than blindly
+            // sliced from a stale index.
+            chatLength: totalLen,
+            // Always store the resolved base so this value stays stable across
+            // runs even after the character card gets relinked to a timestamped
+            // sibling. Avoids confusing "sourceLorebook" drift in saved metadata.
+            sourceLorebook: baseName,
+        };
+        await ctx.saveMetadata();
+    }
 
     const parts = [
         `Created "${newName}" with ${entryCount} entr${entryCount === 1 ? 'y' : 'ies'}`,
@@ -1598,6 +1758,25 @@ async function onExtendClicked(event) {
     }
 }
 
+async function onGenerateClicked(event) {
+    event?.preventDefault?.();
+    const button = event?.currentTarget;
+    button?.classList?.add('disabled');
+    try {
+        setStatus('Working…', 'info');
+        const result = await runPipeline({ mode: 'generate' });
+        setStatus(result, 'success');
+        toastr.success(result, 'Lorebook Extender');
+    } catch (e) {
+        const msg = (e && e.message) ? e.message : String(e);
+        console.error(`[${MODULE_NAME}]`, e);
+        setStatus(msg, 'error');
+        toastr.error(msg, 'Lorebook Extender');
+    } finally {
+        button?.classList?.remove('disabled');
+    }
+}
+
 async function onResetSnapshotClicked() {
     const ctx = SillyTavern.getContext();
     if (!ctx.chatMetadata) {
@@ -1873,6 +2052,8 @@ function bindUi(root) {
     const enabledEl = /** @type {HTMLInputElement} */ ($('#lbx_enabled'));
     const systemEl = /** @type {HTMLTextAreaElement} */ ($('#lbx_system_prompt'));
     const userEl = /** @type {HTMLTextAreaElement} */ ($('#lbx_user_prompt'));
+    const genSystemEl = /** @type {HTMLTextAreaElement} */ ($('#lbx_generate_system_prompt'));
+    const genUserEl = /** @type {HTMLTextAreaElement} */ ($('#lbx_generate_user_prompt'));
     const maxTokEl = /** @type {HTMLInputElement} */ ($('#lbx_max_tokens'));
     const maxVerEl = /** @type {HTMLInputElement} */ ($('#lbx_max_versions'));
     const maxMsgEl = /** @type {HTMLInputElement} */ ($('#lbx_max_messages'));
@@ -1880,6 +2061,7 @@ function bindUi(root) {
     const runBtn = $('#lbx_run');
     const resetBtn = $('#lbx_reset_snapshot');
     const viewDiffBtn = $('#lbx_view_diff');
+    const generateBtn = $('#lbx_generate');
     const profileEl = /** @type {HTMLSelectElement} */ ($('#lbx_profile'));
     statusEl = $('#lbx_status');
 
@@ -1887,6 +2069,8 @@ function bindUi(root) {
     enabledEl.checked = settings.enabled;
     systemEl.value = settings.systemPrompt;
     userEl.value = settings.userPromptTemplate;
+    if (genSystemEl) genSystemEl.value = settings.generateSystemPrompt;
+    if (genUserEl) genUserEl.value = settings.generateUserPromptTemplate;
     maxTokEl.value = String(settings.maxTokens);
     maxVerEl.value = String(settings.maxVersions);
     maxMsgEl.value = String(settings.maxMessages);
@@ -1896,6 +2080,8 @@ function bindUi(root) {
     enabledEl.addEventListener('change', () => { settings.enabled = enabledEl.checked; persistSettings(); });
     systemEl.addEventListener('input', () => { settings.systemPrompt = systemEl.value; persistSettings(); });
     userEl.addEventListener('input', () => { settings.userPromptTemplate = userEl.value; persistSettings(); });
+    genSystemEl?.addEventListener('input', () => { settings.generateSystemPrompt = genSystemEl.value; persistSettings(); });
+    genUserEl?.addEventListener('input', () => { settings.generateUserPromptTemplate = genUserEl.value; persistSettings(); });
     maxTokEl.addEventListener('change', () => {
         const v = parseInt(maxTokEl.value, 10);
         settings.maxTokens = Number.isFinite(v) && v > 0 ? v : DEFAULT_SETTINGS.maxTokens;
@@ -1920,6 +2106,7 @@ function bindUi(root) {
     runBtn?.addEventListener('click', onExtendClicked);
     resetBtn?.addEventListener('click', onResetSnapshotClicked);
     viewDiffBtn?.addEventListener('click', onViewDiffClicked);
+    generateBtn?.addEventListener('click', onGenerateClicked);
 
     // Connection profile dropdown. Use the Connection Manager helper when available,
     // otherwise build a static placeholder.

@@ -33,6 +33,8 @@ Open *Extensions* → **Lorebook Extender** drawer. Settings:
 | Connection profile | Which Connection Manager profile to use. Leave on `(Active profile)` to use whatever the user has selected. |
 | System prompt | Sent as the `system` role. |
 | User prompt template | Sent as the `user` role. Supports `{{CHARACTER_NAME}}`, `{{ORIGINAL_LOREBOOK}}`, `{{DIFF}}`. |
+| Generate system prompt | Sent as the `system` role by **Generate from card**. |
+| Generate user prompt template | Sent as the `user` role by **Generate from card**. Supports `{{CHARACTER_NAME}}`, `{{CHARACTER_CARD}}` (sanitized character card JSON), `{{DIFF}}`. |
 | Max output tokens | Cap on the LLM response length. |
 | Max versions to keep | How many timestamped siblings to keep before pruning. |
 | Max messages to send | Caps how many of the newest visible chat messages are sent to the LLM. `0` = no limit. When the diff exceeds the cap, only the most recent messages are sent (the snapshot still advances past the whole diff, so nothing is re-sent later). |
@@ -45,6 +47,18 @@ Action buttons:
 | Extend Lorebook Now | Runs the full extend pipeline (diff chat, call LLM, save new timestamped lorebook, prune old versions). |
 | Reset snapshot | Forgets the per-chat snapshot so the next *Extend* starts fresh. |
 | View latest diff | Opens a read-only popup comparing the newest extended sibling against the character's currently linked lorebook. |
+| Generate from card | Builds a **brand-new** lorebook from the character card + chat, ignoring any linked lorebook and the per-chat snapshot. See below. |
+
+## Generate from card
+
+The **Generate from card** button creates a *brand-new* lorebook from scratch using the active character's card plus the current chat. Unlike *Extend*, it:
+
+- **Ignores any linked lorebook** — no existing lorebook is loaded or sent, so the character doesn't need one linked. Only the character card JSON, the chat, and the *Generate* prompts are sent to the LLM.
+- **Ignores the per-chat snapshot** — it neither reads nor advances it, so a later *Extend Lorebook Now* still behaves exactly as before. It sends the chat capped by *Max messages to send* (newest kept; `0` = whole chat).
+- Sends a **sanitized** character card: narrative fields only (name, description, personality, scenario, first message, example messages, system prompt, post-history instructions, creator notes, tags, alternate greetings, and any embedded character book entries). Avatars, chat history, and bookkeeping fields are stripped to save tokens.
+- Saves the result as a new lorebook named `<CharacterName> - YYYY-MM-DD HH-mm-ss`, pruned by *Max versions to keep* just like extended siblings.
+
+The prompts are configured by **Generate system prompt** and **Generate user prompt template** in the drawer; the user template supports `{{CHARACTER_NAME}}`, `{{CHARACTER_CARD}}`, and `{{DIFF}}`.
 
 ## View latest diff
 
